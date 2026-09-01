@@ -96,6 +96,11 @@ def check_database_url(dsn: str = DATABASE_URL) -> list[str]:
 
 FAMILY_SCHEMA = "family"
 
+# Must match family_link.command_channel(). Duplicated rather than imported
+# because family_link imports *this* module, and the alternative is a cycle
+# for the sake of one string.
+COMMAND_CHANNEL_PREFIX = "family_cmd_"
+
 
 # ---------------------------------------------------------------------------
 # One pooled connection per process
@@ -316,6 +321,14 @@ def log_event(bot_id: str, level: str, kind: str, message: str) -> None:
 
 def queue_command(target_bot: str, command: str, args: str, requested_by: int,
                   reply_chat_id: int) -> int:
+    """Queue one command and wake its target.
+
+    The NOTIFY rides the same transaction as the INSERT, so the target bot
+    cannot be woken to find a row that is not committed yet. It is what turns
+    a command from "picked up within the next poll" into "picked up in
+    milliseconds"; a bot that is not listening still finds it on its next
+    safety poll, so nothing depends on the notification arriving.
+    """
     with pooled() as conn:
         cur = conn.execute(
             f"""
@@ -325,6 +338,7 @@ def queue_command(target_bot: str, command: str, args: str, requested_by: int,
             (target_bot, command, args, requested_by, reply_chat_id),
         )
         command_id = cur.fetchone()[0]
+        conn.execute("SELECT pg_notify(%s, %s)", (COMMAND_CHANNEL_PREFIX + target_bot, str(command_id)))
         conn.commit()
         return command_id
 
@@ -339,7 +353,9 @@ def take_finished_commands(limit: int = 5) -> list[dict]:
                 WHERE delivered = FALSE AND status IN ('done', 'failed', 'timeout')
                 ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, target_bot, command, args, reply_chat_id, status, ok, output, file_name, file_bytes
+            RETURNING id, target_bot, command, args, reply_chat_id, status, ok, output,
+                      file_name, file_bytes, created_at, claimed_at, finished_at,
+                      clock_timestamp() AS taken_at
             """,
             (limit,),
         )

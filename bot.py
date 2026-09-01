@@ -30,8 +30,11 @@ it empty the bot refuses to start rather than run wide open), DATABASE_URL
 """
 import asyncio
 import html
+import json
 import logging
 import os
+import time as time_module
+from collections import OrderedDict
 from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
 
@@ -55,6 +58,8 @@ from telegram.ext import (
 
 import db
 import family_link
+import lifecycle
+from live_message import LiveMessage, edit_in_place
 from db import init_db
 from monitoring import (
     attach_maintenance,
@@ -87,6 +92,24 @@ DOWN_AFTER_SECONDS = int(os.environ.get("PBOT_DOWN_AFTER_SECONDS", "120"))
 # How long a queued command waits for its target before ParentBot gives up
 # and says so.
 COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PBOT_COMMAND_TIMEOUT_SECONDS", "90"))
+
+# How often the result and event queues are swept when nothing has woken
+# them. Both are pushed over LISTEN/NOTIFY now (see family_link.py), so these
+# only matter for a notification that arrived while a listener was
+# reconnecting. Set FAMILY_LISTEN=off to go back to polling as the primary
+# mechanism, in which case drop these back to 3 and 20.
+RESULT_POLL_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_SECONDS", "30"))
+EVENT_POLL_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_SECONDS", "60"))
+
+# A redeploy makes a bot's heartbeat stale exactly the way a crash does, and
+# for the first minute of it there is no way to tell them apart from the
+# outside. So the inside says: a bot that is shut down on purpose leaves a
+# note in family.settings on its way out (lifecycle.mark_expected_restart),
+# and a stale heartbeat with a fresh note next to it is reported as a
+# redeploy rather than as a failure. If it is still missing when the note has
+# gone stale, the ordinary "it is down" alert fires after all -- a deploy
+# that never came back is exactly the thing worth being told about.
+REDEPLOY_GRACE_SECONDS = int(os.environ.get("PBOT_REDEPLOY_GRACE_SECONDS", "300"))
 
 # How long the startup roll-call waits before reporting who is up. The point
 # of the delay is to send one message instead of five: the other four write
@@ -350,13 +373,12 @@ async def board_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Every bot may well be fine -- this is ParentBot's own connection failing."
         )
         return
-    try:
-        await query.message.edit_text(board, parse_mode=ParseMode.HTML, reply_markup=_board_keyboard())
-    except Exception:
-        # "message is not modified" when nothing changed within the same
-        # second -- the timestamp in the footer makes this rare, and it is
-        # never worth surfacing.
-        pass
+    # live_message rather than edit_text: it swallows "message is not
+    # modified" (which the timestamp in the footer makes rare anyway), and it
+    # moves the board down to the bottom of the chat if anything has been
+    # said since the buttons were tapped.
+    await edit_in_place(query.message, context.bot, board,
+                        parse_mode=ParseMode.HTML, reply_markup=_board_keyboard())
 
 
 async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -433,9 +455,144 @@ def _shortcut(command: str, min_args: int, usage: str):
     return handler
 
 
+# ---------------------------------------------------------------------------
+# /ping -- the whole round trip, leg by leg
+# ---------------------------------------------------------------------------
+# "Is it up?" was the old question and a word was a fine answer. The useful
+# question is "where does the time go?", and answering that means measuring
+# five separate hops on two machines whose clocks do not agree:
+#
+#   the phone -> Telegram -> here     network, plus however long the update
+#                                     sat in Telegram's queue
+#   here -> Supabase                  the INSERT that queues the command
+#   Supabase -> the target bot        how fast it hears about it
+#   the target bot                    its own work, including its own hop to
+#                                     Supabase
+#   Supabase -> here                  the answer coming back
+#
+# Two machines, one honest clock. Every cross-machine figure below is a
+# difference between two Postgres timestamps -- created_at, claimed_at,
+# finished_at, clock_timestamp() at pickup -- so none of them contains the
+# difference between this host's idea of the time and Railway's. The
+# per-machine figures (each end's own round trip to Supabase, and its clock
+# skew against it) are measured locally at each end and reported separately,
+# which is what makes "the database is slow from there" distinguishable from
+# "that bot is slow".
+#
+# The one figure that is *not* exact is the first: Telegram stamps a message
+# with whole seconds, so the phone-to-here leg is only good to about a
+# second, and it is labelled that way rather than quietly presented as
+# precise.
+
+_PING_TRACES: "OrderedDict[int, dict]" = OrderedDict()
+MAX_PING_TRACES = 64
+
+
+def _remember_trace(command_id: int, trace: dict) -> None:
+    _PING_TRACES[command_id] = trace
+    while len(_PING_TRACES) > MAX_PING_TRACES:
+        _PING_TRACES.popitem(last=False)
+
+
+def _ms(delta) -> str:
+    """A duration, in whichever unit makes it readable. Takes a timedelta
+    (the Postgres-clock differences) or a plain number of milliseconds (the
+    locally measured legs)."""
+    if delta is None:
+        return "     ?"
+    ms = delta.total_seconds() * 1000 if hasattr(delta, "total_seconds") else float(delta)
+    if ms >= 1000:
+        return f"{ms / 1000:6.2f} s"
+    return f"{ms:6.0f} ms"
+
+
+def _row(label: str, value: str) -> str:
+    return f"{label:<30}{value}"
+
+
+def _describe_end(name: str, where: str, probe: dict) -> str:
+    if not probe or "error" in probe:
+        return _row(name, (probe or {}).get("error", "not reported"))
+    skew = probe.get("skew_ms", 0)
+    bits = [f"Supabase {_ms(probe.get('db_ms', 0)).strip()}",
+            f"clock {skew:+.0f} ms"]
+    if probe.get("listen") is False:
+        bits.append("polling")
+    return f"{name}\n  {where}\n  " + " · ".join(bits)
+
+
+def _render_ping(trace: dict, result: dict) -> str:
+    """The report. Everything in the first block is one Postgres clock or a
+    stopwatch that started and stopped in this process; nothing in it is a
+    subtraction across two machines' clocks."""
+    name = trace["bot"]["name"]
+    created, claimed = result.get("created_at"), result.get("claimed_at")
+    finished, taken = result.get("finished_at"), result.get("taken_at")
+
+    if result["status"] == "timeout" or claimed is None:
+        return (f"🏓 <b>{html.escape(name)}</b> — no answer in {COMMAND_TIMEOUT_SECONDS}s.\n"
+                f"It never picked the ping up, which means its process is not running.")
+
+    there = {}
+    try:
+        there = json.loads(result.get("output") or "{}")
+    except ValueError:
+        pass
+
+    lines = [
+        _row("you → Telegram → ParentBot", _ms(trace["to_parent"]) + "   ±1 s"),
+        _row("ParentBot → Telegram (ack)", _ms(trace["ack_ms"])),
+        _row("ParentBot → Supabase (queue)", _ms(trace["queue_ms"])),
+        _row(f"queued → {name} claimed it", _ms(claimed - created)),
+        _row(f"{name} answering", _ms(finished - claimed)),
+        _row("Supabase → ParentBot", _ms(taken - finished)),
+        "─" * 40,
+        _row("bus round trip", _ms(taken - created)),
+    ]
+
+    head = f"🏓 <b>{html.escape(name)}</b> — {_ms(taken - created).strip()} on the bus"
+    ends = "\n\n".join([
+        _describe_end("ParentBot", trace["here"].get("where", "?"), trace["here"]),
+        _describe_end(name, there.get("where", "?"), there),
+    ])
+    up = there.get("up")
+    tail = f"\nUp {up}." if up else ""
+    return (f"{head}\n\n<pre>{html.escape(chr(10).join(lines))}</pre>\n"
+            f"<b>Each end</b>\n{html.escape(ends)}{html.escape(tail)}")
+
+
+async def _ping_one(update: Update, context: ContextTypes.DEFAULT_TYPE, bot: dict) -> None:
+    started = time_module.perf_counter()
+    now = datetime.now(timezone.utc)
+    live = await LiveMessage.reply_to(update.message, f"🏓 {bot['name']} — timing the round trip…")
+    ack_ms = (time_module.perf_counter() - started) * 1000
+
+    # This end's own distance from the database, measured the same way the
+    # far end measures its own -- the two are only comparable because both
+    # are one round trip from the same probe.
+    try:
+        here = await asyncio.to_thread(family_link.ping_probe)
+    except Exception as exc:
+        here = {"error": f"{type(exc).__name__}: {exc}"}
+
+    queue_started = time_module.perf_counter()
+    command_id = await asyncio.to_thread(
+        db.queue_command, bot["id"], "ping", "trace",
+        update.effective_user.id, update.effective_chat.id,
+    )
+    queue_ms = (time_module.perf_counter() - queue_started) * 1000
+
+    _remember_trace(command_id, {
+        "bot": bot, "live": live, "here": here,
+        "to_parent": now - update.message.date,
+        "ack_ms": ack_ms, "queue_ms": queue_ms,
+    })
+
+
 async def broadcast_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ping with no bot named asks every one of them at once -- the fastest
-    way to tell "the database is down" from "one bot is down"."""
+    """/ping <bot> reports the round trip leg by leg. /ping with nothing
+    named asks all of them at once and reports one line each -- still the
+    fastest way to tell "the database is down" from "one bot is down"."""
     if not await guard(update, context):
         return
     if context.args:
@@ -443,15 +600,41 @@ async def broadcast_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not bot:
             await update.message.reply_text(f"No such bot: {context.args[0]}. Known: {bot_list_hint()}")
             return
-        await _dispatch(update, context, bot, "ping", [])
+        await _ping_one(update, context, bot)
         return
+
+    live = await LiveMessage.reply_to(update.message, f"🏓 Pinging all {len(CHILDREN)}…")
+    group = {"live": live, "rows": {}, "expected": len(CHILDREN)}
     for child in CHILDREN:
-        await asyncio.to_thread(
-            db.queue_command, child["id"], "ping", "",
+        command_id = await asyncio.to_thread(
+            db.queue_command, child["id"], "ping", "trace",
             update.effective_user.id, update.effective_chat.id,
         )
-    await update.message.reply_text(f"Pinged all {len(CHILDREN)}. Silence past "
-                                    f"{COMMAND_TIMEOUT_SECONDS}s means down.")
+        _remember_trace(command_id, {"bot": child, "group": group})
+
+
+async def _deliver_ping(context: ContextTypes.DEFAULT_TYPE, trace: dict, result: dict) -> None:
+    """A ping's answer replaces the message that announced it, rather than
+    arriving underneath -- and moves to the bottom of the chat by itself if
+    anything was said in the meantime (see live_message.py)."""
+    group = trace.get("group")
+    if group is None:
+        await trace["live"].set(context.bot, _render_ping(trace, result), parse_mode=ParseMode.HTML)
+        return
+
+    name = trace["bot"]["name"]
+    if result["status"] == "timeout" or not result.get("claimed_at"):
+        group["rows"][name] = "no answer — down"
+    else:
+        group["rows"][name] = _ms(result["taken_at"] - result["created_at"]).strip()
+    lines = [f"{n:<14}{v}" for n, v in sorted(group["rows"].items())]
+    missing = group["expected"] - len(group["rows"])
+    text = f"🏓 <b>Family ping</b>\n<pre>{html.escape(chr(10).join(lines))}</pre>"
+    if missing > 0:
+        text += f"\nWaiting on {missing} more (down after {COMMAND_TIMEOUT_SECONDS}s)."
+    else:
+        text += "\nRound trip through Postgres. /ping &lt;bot&gt; breaks one of them down."
+    await group["live"].set(context.bot, text, parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +756,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await asyncio.to_thread(db.dump_family_csv_zip, schemas)
     except Exception as exc:
-        await note.edit_text(f"⚠️ Export failed: {exc}")
+        await edit_in_place(note, context.bot, f"⚠️ Export failed: {exc}")
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     await update.message.reply_document(
@@ -704,6 +887,27 @@ _db_failures = 0
 _db_alerted = False
 
 
+async def _is_redeploying(bot_id: str) -> bool:
+    """True while a bot's own goodbye note is still fresh."""
+    key = lifecycle.RESTART_NOTE_PREFIX + bot_id
+    try:
+        raw = await asyncio.to_thread(db.get_setting, key)
+        if not raw:
+            return False
+        stamped = datetime.fromisoformat(raw)
+    except Exception:
+        return False
+    age = (datetime.now(timezone.utc) - stamped).total_seconds()
+    return 0 <= age <= REDEPLOY_GRACE_SECONDS
+
+
+async def _clear_redeploy_note(bot_id: str) -> None:
+    try:
+        await asyncio.to_thread(db.set_setting, lifecycle.RESTART_NOTE_PREFIX + bot_id, "")
+    except Exception:
+        logger.debug("Could not clear the redeploy note for %s", bot_id, exc_info=True)
+
+
 async def watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
     global _db_failures, _db_alerted
     try:
@@ -748,15 +952,24 @@ async def watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
         if is_up == was_up:
             continue
 
-        await asyncio.to_thread(db.set_known_state, bot["id"], is_up)
         if is_up:
+            await asyncio.to_thread(db.set_known_state, bot["id"], True)
+            await _clear_redeploy_note(bot["id"])
             uptime = format_delta((datetime.now(timezone.utc) - beat["started_at"]).total_seconds())
             await notify_owner(
                 context,
                 f"✅ <b>{bot['name']}</b> is back up (started {uptime} ago, "
                 f"on {html.escape(beat['host'] or '?')})."
             )
+        elif await _is_redeploying(bot["id"]):
+            # Deliberate, and recent. Leave known_state alone so that the
+            # "it is back" message is not announced either -- a redeploy the
+            # owner started should be silent at both ends. If it does not
+            # come back, the note ages out and the next pass alerts.
+            logger.info("%s is stale but was shut down on purpose -- redeploying.", bot["id"])
+            continue
         else:
+            await asyncio.to_thread(db.set_known_state, bot["id"], False)
             last = format_delta(beat["seconds_ago"]) if beat else "?"
             await notify_owner(
                 context,
@@ -802,6 +1015,15 @@ async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     for result in results:
+        # A /ping is answered by rewriting the message that announced it,
+        # with the whole round trip broken down -- not by a second message
+        # underneath. Checked before reply_chat_id because the trace already
+        # holds the message it is going to become.
+        trace = _PING_TRACES.pop(result["id"], None)
+        if trace is not None:
+            await _deliver_ping(context, trace, result)
+            continue
+
         chat_id = result["reply_chat_id"]
         if not chat_id:
             continue
@@ -862,6 +1084,14 @@ HELP = """👪 <b>ParentBot</b> — the family's manager.
 /dbdump &lt;bot&gt; — that bot's own tables as CSVs
 /restart &lt;bot&gt; — restart its process
 
+<b>Shipping an update</b>
+/pause [bot|all] [minutes] — stop them taking work an update would lose;
+    whoever asks is told to come back, and written down
+/warn [bot|all] — tell whoever is mid-something that it is about to reset
+/finishupdates [bot|all] — reopen, and tell everyone who was turned away
+    (yours to say, so one update can be as many deploys as it needs)
+/broadcast &lt;bot|all&gt; &lt;text&gt; — one message to everyone, <i>as</i> that bot
+
 <b>Across the whole family</b>
 /users [hours] — active users per bot, default 24h
 /donations — paid donations per bot
@@ -898,6 +1128,190 @@ async def crashtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raise RuntimeError("Manual /crashtest trigger -- ParentBot's error tracking works.")
 
 
+# ---------------------------------------------------------------------------
+# Running an update without ambushing anybody
+# ---------------------------------------------------------------------------
+# Four commands, in the order they are meant to be used:
+#
+#   /pause           the bots stop starting work a restart would throw away,
+#                    and tell whoever asks how long they expect to be. Anyone
+#                    turned away is written down.
+#   /warn            everyone already mid-something hears that it is about to
+#                    be reset -- before the deploy, not as the door closes.
+#   ...deploy, as many times as it takes...
+#   /finishupdates   the bots reopen, and everyone who was turned away is
+#                    told they can try again.
+#
+# /broadcast is the odd one out and belongs here anyway: it is the same
+# "speak as the bot they actually talk to" mechanism, for anything the owner
+# wants to say that these four sentences do not cover.
+#
+# Nothing here is on a timer. An update is usually several deploys, and a
+# pause that expired on its own would let the bots reopen between two of
+# them -- which is the exact window this is meant to close.
+
+def _targets(token: str | None) -> list[dict] | None:
+    """The bots a command applies to. No name, or "all", means every child --
+    ParentBot is never a target: it is the one doing the asking, and it has
+    no users to announce anything to."""
+    if not token or token.lower() == "all":
+        return list(CHILDREN)
+    bot = resolve_bot(token)
+    if not bot or bot["id"] == BOT_NAME:
+        return None
+    return [bot]
+
+
+async def _fan_out(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                   targets: list[dict], command: str, args: str, headline: str) -> None:
+    """Queue one family command to several bots and say so once.
+
+    Deliberately not a progress report: each bot answers in its own time and
+    its answer arrives on its own, the way every other /run result does.
+    """
+    for bot in targets:
+        await asyncio.to_thread(
+            db.queue_command, bot["id"], command, args,
+            update.effective_user.id, update.effective_chat.id,
+        )
+    names = ", ".join(b["name"] for b in targets)
+    await update.message.reply_text(f"{headline}\n→ {names}")
+
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pause [bot|all] [minutes] — stop taking new long work, and say why."""
+    if not await guard(update, context):
+        return
+    args = list(context.args)
+    minutes = None
+    if args and args[-1].isdigit():
+        minutes = args.pop()
+    targets = _targets(args[0] if args else None)
+    if targets is None:
+        await update.message.reply_text(
+            f"Usage: /pause [bot|all] [minutes]. Known: {bot_list_hint()}"
+        )
+        return
+    promised = minutes or str(lifecycle.DEFAULT_MAINTENANCE_MINUTES)
+    await _fan_out(
+        update, context, targets, "pause", minutes or "",
+        f"⏸ Paused — telling users to come back in about {promised} minute(s).\n"
+        f"They stay paused until /finishupdates, however many deploys that takes.",
+    )
+
+
+async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warn [bot|all] — tell whoever is mid-something that it will be reset."""
+    if not await guard(update, context):
+        return
+    targets = _targets(context.args[0] if context.args else None)
+    if targets is None:
+        await update.message.reply_text(f"Usage: /warn [bot|all]. Known: {bot_list_hint()}")
+        return
+    await _fan_out(
+        update, context, targets, "warnbusy", "",
+        "📣 Warning everyone with work in flight that it is about to be reset.",
+    )
+
+
+async def finish_updates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/finishupdates [bot|all] — reopen, and go back to everyone turned away.
+
+    Explicitly the owner's call and never automatic: one update is usually
+    several deploys, and only the person doing them knows which one was the
+    last.
+    """
+    if not await guard(update, context):
+        return
+    targets = _targets(context.args[0] if context.args else None)
+    if targets is None:
+        await update.message.reply_text(
+            f"Usage: /finishupdates [bot|all]. Known: {bot_list_hint()}"
+        )
+        return
+    await _fan_out(
+        update, context, targets, "resume", "",
+        "✅ Reopening — everyone who was turned away is being told they can try again.",
+    )
+
+
+# ---- /broadcast, which asks before it speaks ------------------------------
+# Every other command here affects people who are already mid-something with
+# a bot. This one reaches everyone the bot has ever met, cannot be recalled,
+# and is one fat-fingered bot name away from going to the wrong audience. So
+# it is the one command in ParentBot that asks twice.
+
+BROADCAST_PENDING = "broadcast_pending"
+BROADCAST_PREVIEW = 3000
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <bot|all> <text> — one message to everyone, as that bot."""
+    if not await guard(update, context):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            f"Usage: /broadcast &lt;bot|all&gt; &lt;text&gt;\nKnown: {bot_list_hint()}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    targets = _targets(context.args[0])
+    if targets is None:
+        await update.message.reply_text(
+            f"No such bot: {context.args[0]}. Known: {bot_list_hint()}"
+        )
+        return
+    text = " ".join(context.args[1:]).strip()
+    if not text:
+        await update.message.reply_text("Nothing to say — give it some text.")
+        return
+
+    context.user_data[BROADCAST_PENDING] = {
+        "bots": [b["id"] for b in targets],
+        "text": text,
+    }
+    names = ", ".join(b["name"] for b in targets)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Send it", callback_data="upd:send"),
+        InlineKeyboardButton("Cancel", callback_data="upd:cancel"),
+    ]])
+    await update.message.reply_text(
+        f"📢 <b>Send as {html.escape(names)}, to everyone they know?</b>\n\n"
+        f"<pre>{html.escape(text[:BROADCAST_PREVIEW])}</pre>\n"
+        f"This cannot be taken back.",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
+
+
+async def broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await guard(update, context):
+        return
+    pending = context.user_data.pop(BROADCAST_PENDING, None)
+    if query.data == "upd:cancel" or not pending:
+        await query.answer()
+        await edit_in_place(
+            query.message, context.bot,
+            "Cancelled — nothing was sent." if pending else
+            "That broadcast is no longer waiting. Send /broadcast again.",
+        )
+        return
+
+    await query.answer()
+    sent_to = []
+    for bot_id in pending["bots"]:
+        await asyncio.to_thread(
+            db.queue_command, bot_id, "broadcast", pending["text"],
+            update.effective_user.id, update.effective_chat.id,
+        )
+        sent_to.append(bot_id)
+    await edit_in_place(
+        query.message, context.bot,
+        f"📢 Queued to {', '.join(sent_to)}. Each one reports back when it has "
+        f"finished going through its list.",
+    )
+
+
 BOT_COMMANDS = [
     BotCommand("status", "every bot: up/down, uptime, errors"),
     BotCommand("me", "ParentBot's own status"),
@@ -907,6 +1321,10 @@ BOT_COMMANDS = [
     BotCommand("logs", "tail a bot's log"),
     BotCommand("whois", "look a user up through a bot"),
     BotCommand("say", "DM someone as one of the bots"),
+    BotCommand("broadcast", "message everyone, as one of the bots"),
+    BotCommand("pause", "stop the bots taking work an update would lose"),
+    BotCommand("warn", "tell whoever is mid-something that it will reset"),
+    BotCommand("finishupdates", "reopen, and tell everyone who was waiting"),
     BotCommand("dbdump", "one bot's tables as CSVs"),
     BotCommand("restart", "restart a bot's process"),
     BotCommand("users", "active users per bot"),
@@ -921,7 +1339,13 @@ BOT_COMMANDS = [
 
 async def _post_init(application):
     await tune_runtime(application)
+    await lifecycle.on_start(BOT_NAME)
     await application.bot.set_my_commands(BOT_COMMANDS)
+
+
+async def _post_stop(application):
+    await lifecycle.on_stop(application)
+    await flush_on_shutdown(application)
 
 
 def main():
@@ -939,10 +1363,15 @@ def main():
 
     init_db()
 
-    app = (
+    builder = (
         ApplicationBuilder().token(BOT_TOKEN)
-        .post_init(_post_init).post_stop(flush_on_shutdown).build()
+        .post_init(_post_init).post_stop(_post_stop)
     )
+    state = lifecycle.persistence()
+    if state is not None:
+        builder = builder.persistence(state)
+    app = builder.build()
+    lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
 
@@ -966,7 +1395,13 @@ def main():
     app.add_handler(CommandHandler("whois", _shortcut("whois", 2, "Usage: /whois <bot> <user_id>")))
     app.add_handler(CommandHandler("say", _shortcut("message", 3, "Usage: /say <bot> <user_id> <text>")))
 
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("pause", pause_command))
+    app.add_handler(CommandHandler("warn", warn_command))
+    app.add_handler(CommandHandler("finishupdates", finish_updates_command))
+
     app.add_handler(CallbackQueryHandler(board_button, pattern=r"^board:"))
+    app.add_handler(CallbackQueryHandler(broadcast_button, pattern=r"^upd:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
 
@@ -985,8 +1420,28 @@ def main():
     # family.bot_state and the watchdog has nothing left to announce.
     app.job_queue.run_once(startup_rollcall, when=STARTUP_ROLLCALL_SECONDS)
     app.job_queue.run_repeating(watchdog, interval=60, first=20)
-    app.job_queue.run_repeating(event_pump, interval=20, first=10)
-    app.job_queue.run_repeating(result_pump, interval=3, first=5)
+    # Both pumps used to be the whole delivery mechanism, and were fast for
+    # that reason: 20s and 3s, forever, mostly to find nothing. Both are now
+    # woken by the writer over LISTEN/NOTIFY the moment there is something to
+    # collect, so these intervals are the safety net for a notification that
+    # was sent while nobody happened to be listening -- rare, and a slow
+    # backstop is the right shape for it.
+    app.job_queue.run_repeating(event_pump, interval=EVENT_POLL_SECONDS, first=10)
+    app.job_queue.run_repeating(result_pump, interval=RESULT_POLL_SECONDS, first=5)
+
+    async def _wake_results():
+        app.job_queue.run_once(result_pump, when=0)
+
+    async def _wake_events():
+        app.job_queue.run_once(event_pump, when=0)
+
+    async def _start_listeners(_context):
+        # From a job rather than from here: main() has no running event loop
+        # to create tasks on until run_polling() starts one.
+        family_link.listen_for(family_link.RESULT_CHANNEL, _wake_results)
+        family_link.listen_for(family_link.EVENT_CHANNEL, _wake_events)
+
+    app.job_queue.run_once(_start_listeners, when=0)
     if DIGEST_AT_UTC:
         hour, _, minute = DIGEST_AT_UTC.partition(":")
         app.job_queue.run_daily(
@@ -1004,10 +1459,10 @@ def main():
     # answers the moment an update exists -- for a third of the HTTP requests.
     # ParentBot has one user, so nearly every request it makes all day is an
     # empty poll.
-    app.run_polling(
+    app.run_polling(**lifecycle.polling_kwargs(
         timeout=POLL_TIMEOUT,
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
-    )
+    ))
 
 
 if __name__ == "__main__":

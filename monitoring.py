@@ -12,9 +12,11 @@ others should be watched by exactly the same machinery, so "ParentBot has
 been quietly crashing" is as visible as it would be for any of them.
 """
 import asyncio
+import gc
 import logging
 import os
 import socket
+import sys
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +26,7 @@ from logging.handlers import RotatingFileHandler
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
 import db
+import live_message
 
 _LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 
@@ -217,6 +220,9 @@ async def _flush_activity_job(context) -> None:
 
 async def track_activity(update, context) -> None:
     note_network_ok()
+    # See shared_features: this is what lets an evolving message tell whether
+    # it is still the last thing in the chat.
+    live_message.note_update(update)
     user = update.effective_user
     if not user:
         return
@@ -224,14 +230,20 @@ async def track_activity(update, context) -> None:
 
 
 WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "4"))
+GC_THRESHOLD = int(os.environ.get("GC_GEN0_THRESHOLD", "5000"))
 
 
 async def tune_runtime(application) -> None:
     """Call from post_init -- see shared_features.py for why the default
-    executor is worth capping on a shared cloud host."""
+    executor is worth capping, why everything imported at startup is worth
+    freezing out of the garbage collector's reach, and why an idle process
+    should not be sweeping its heap every few seconds."""
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="worker")
     )
+    gc.collect()
+    gc.freeze()
+    gc.set_threshold(GC_THRESHOLD, 20, 20)
 
 
 def attach_maintenance(app) -> None:
@@ -263,6 +275,84 @@ def detect_host_environment() -> str:
     return f"💻 Local ({socket.gethostname()})"
 
 
+# ---------------------------------------------------------------------------
+# What this process actually costs to run
+# ---------------------------------------------------------------------------
+# A usage-billed host charges for resident memory and CPU seconds, and until
+# this was on /status there was no way to tell whether a change to either had
+# helped, hurt, or done nothing. Every number here is read from the kernel,
+# free, and only when someone asks.
+
+def _read_first_int(path: str, key: str | None = None) -> int | None:
+    try:
+        with open(path) as handle:
+            if key is None:
+                text = handle.read().strip()
+                return int(text) if text.isdigit() else None
+            for line in handle:
+                if line.startswith(key):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _memory_ceiling_bytes() -> int | None:
+    """What the container is allowed, rather than what the host has. cgroup
+    v2 first (every current Linux container runtime), then v1."""
+    for path, scale in (("/sys/fs/cgroup/memory.max", 1),
+                        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", 1)):
+        value = _read_first_int(path)
+        # An unset cgroup limit is reported as a number near 2^63, which is
+        # "the whole machine" and worth nothing as a denominator.
+        if value and value < (1 << 62):
+            return value * scale
+    return None
+
+
+def _mb(value_bytes: float) -> str:
+    return f"{value_bytes / (1024 * 1024):.0f} MB"
+
+
+def process_footprint() -> str:
+    """One line: resident memory, its high-water mark, and CPU seconds burned
+    since startup. Read /proc where it exists (Linux, which is what the
+    deployed containers are) and fall back to getrusage elsewhere."""
+    parts = []
+
+    resident = _read_first_int("/proc/self/status", "VmRSS:")
+    peak = _read_first_int("/proc/self/status", "VmHWM:")
+    if resident is not None:
+        line = f"Memory: {_mb(resident * 1024)} resident"
+        if peak:
+            line += f" (peak {_mb(peak * 1024)})"
+        ceiling = _memory_ceiling_bytes()
+        if ceiling:
+            line += f" of {_mb(ceiling)} allowed"
+        parts.append(line)
+    else:
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
+            scale = 1 if sys.platform == "darwin" else 1024
+            parts.append(f"Memory: peak {_mb(usage.ru_maxrss * scale)}")
+        except Exception:
+            pass
+
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu = usage.ru_utime + usage.ru_stime
+        parts.append(f"CPU: {cpu:.0f}s used since start")
+    except Exception:
+        pass
+
+    return " · ".join(parts) or "Footprint: not readable on this host"
+
+
 def build_status_text(start_time: datetime, users_last_hour: int, users_since_start: int) -> str:
     now = datetime.now(timezone.utc)
     uptime = now - start_time
@@ -276,6 +366,7 @@ def build_status_text(start_time: datetime, users_last_hour: int, users_since_st
         f"Hosted: {detect_host_environment()}",
         f"Active users (last hour): {users_last_hour}",
         f"Active users (since this start): {users_since_start}",
+        process_footprint(),
         "",
         error_summary(),
     ])

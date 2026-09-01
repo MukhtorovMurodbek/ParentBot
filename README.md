@@ -23,6 +23,42 @@ sentence, and you get told they turned up.
 - **Says when it has gone blind.** If ParentBot's own database connection
   fails, it says so over Telegram — otherwise the one failure that stops all
   the alerts would be the one failure you'd never hear about.
+- **Knows a deploy from a crash.** A redeploy makes a heartbeat stale exactly
+  the way a crash does, so a bot that is shut down on purpose leaves a note
+  in the shared database on its way out, and the watchdog stays quiet at both
+  ends. If it does not come back within `PBOT_REDEPLOY_GRACE_SECONDS` (300),
+  the ordinary "it is down" alert fires after all.
+
+## /ping, in detail
+
+`/ping <bot>` measures the whole round trip rather than answering yes or no:
+
+```
+🏓 StickerBot — 29 ms on the bus
+
+you → Telegram → ParentBot       380 ms   ±1 s
+ParentBot → Telegram (ack)        31 ms
+ParentBot → Supabase (queue)      12 ms
+queued → StickerBot claimed it     9 ms
+StickerBot answering               6 ms
+Supabase → ParentBot              14 ms
+────────────────────────────────────────
+bus round trip                    29 ms
+```
+
+Two machines, one honest clock: every cross-machine figure is the difference
+between two Postgres timestamps, so none of them is contaminated by the gap
+between this host's clock and Railway's. Each end additionally reports its
+own round trip to Supabase and its own skew against it, which is what makes
+"the database is slow from there" distinguishable from "that bot is busy".
+
+The first line is the only approximate one — Telegram stamps messages with
+whole seconds — and it is labelled that way rather than quietly presented as
+precise.
+
+`/ping` with nothing named still asks everyone at once and reports one line
+each. `/ping parent` measures ParentBot against the database and back, which
+is the cleanest reading of how far this machine is from Supabase.
 
 ## Commands
 
@@ -40,7 +76,7 @@ silences it like everything else.
 
 Reaching into a bot:
 - `/run <bot> <command> [args]` — the general form; run it bare for the list
-- `/ping [bot]` — no bot named pings all of them at once
+- `/ping [bot]` — the round trip, leg by leg; no bot named pings all at once
 - `/errors <bot>` — that bot's errors since it last started
 - `/logs <bot> [n]` — tail its `errors.log` (add `bot` for `bot.log`)
 - `/whois <bot> <user_id>` — look someone up through that bot

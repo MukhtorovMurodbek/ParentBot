@@ -3,6 +3,14 @@
 # runtime environment is set here.
 
 [variables]
+# glibc gives a threaded process up to 8 x cpu_count separate malloc arenas,
+# and on a shared cloud host cpu_count is the *machine* -- so a container
+# doing a couple of things at once can end up holding tens of megabytes of
+# per-arena free lists it will never hand back. Resident memory is what a
+# usage-billed host actually charges for, so this is the cheapest single
+# saving available and it costs nothing but a little allocator contention
+# this workload will never reach.
+MALLOC_ARENA_MAX = "2"
 # pip's wheel cache is written into the image and then never read again --
 # tens of megabytes of layer, paid for on every deploy, for nothing.
 PIP_NO_CACHE_DIR = "1"
