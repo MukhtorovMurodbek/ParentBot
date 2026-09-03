@@ -74,7 +74,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.1.1")
+VERSION = os.environ.get("FAMILY_VERSION", "1.1.2")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -109,6 +109,25 @@ COMMAND_IDLE_POLL_SECONDS = int(os.environ.get("FAMILY_COMMAND_IDLE_POLL_SECONDS
 COMMAND_CHANNEL_PREFIX = "family_cmd_"
 RESULT_CHANNEL = "family_result"
 EVENT_CHANNEL = "family_event"
+
+# Pass to every job_queue.run_once(..., when=0) in the family.
+#
+# APScheduler drops a job whose run time has already passed by more than
+# misfire_grace_time, which defaults to one second, and python-telegram-bot
+# does not override it. attach() runs inside main(), so "now" is stamped
+# before run_polling() starts the scheduler -- and between those two moments
+# sits post_init: an advisory lock, the waitlist table, the maintenance flag
+# and set_my_commands, each a round trip to a database on another continent.
+# Several seconds, every time.
+#
+# So the job that starts the LISTEN listener was scheduled, silently
+# discarded as a misfire, and never ran. Not once, on any bot, since the
+# listener shipped in v1.0.1 -- which is why every /status said "NOT
+# listening" with no error to show for it, and why a command that should have
+# been pushed in milliseconds waited for a poll instead. `None` means "run it
+# however late it is", which for a job that only ever means "do this as soon
+# as the loop is up" is the only correct setting.
+RUN_LATE = {"misfire_grace_time": None}
 
 
 def command_channel(bot_id: str) -> str:
@@ -475,7 +494,13 @@ def ping_probe() -> dict:
     """
     local_before = datetime.now(timezone.utc)
     started = time.perf_counter()
-    with _connect() as conn:
+    # Through pooled_read, so this is ONE round trip and reports the distance
+    # to the database rather than the distance times however many statements
+    # the pool wraps around it. Measured through pooled() it was the query
+    # plus an implicit BEGIN plus a COMMIT plus a liveness check -- four trips
+    # to Seoul reported as though they were one, which is how "Supabase 976
+    # ms" ended up on screen for a link that is nearer 250.
+    with db.pooled_read() as conn:
         server_now = conn.execute("SELECT clock_timestamp()").fetchone()[0]
     elapsed_ms = (time.perf_counter() - started) * 1000
     local_after = datetime.now(timezone.utc)
@@ -1097,7 +1122,7 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
             # builds the CallbackContext the command handlers are written
             # against, and it keeps one command on the same path whether it
             # arrived by notify or by poll.
-            app.job_queue.run_once(_poll_commands, when=0)
+            app.job_queue.run_once(_poll_commands, when=0, job_kwargs=RUN_LATE)
 
         async def _start_listener(_context):
             # A run_once job rather than a call from here: attach() runs
@@ -1105,7 +1130,7 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
             # create a task on.
             listen_for(command_channel(bot_id), _wake)
 
-        app.job_queue.run_once(_start_listener, when=0)
+        app.job_queue.run_once(_start_listener, when=0, job_kwargs=RUN_LATE)
 
     # First pass a minute in rather than at startup, so a restart loop cannot
     # turn into a delete storm.
