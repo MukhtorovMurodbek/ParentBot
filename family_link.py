@@ -75,7 +75,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.1.4")
+VERSION = os.environ.get("FAMILY_VERSION", "1.2.1")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -399,8 +399,8 @@ def ping_probe() -> dict:
     # to the database rather than the distance times however many statements
     # the pool wraps around it. Measured through pooled() it was the query
     # plus an implicit BEGIN plus a COMMIT plus a liveness check -- four trips
-    # to Seoul reported as though they were one, which is how "Supabase 976
-    # ms" ended up on screen for a link that is nearer 250.
+    # to the database reported as though they were one, which is how
+    # "Supabase 976 ms" ended up on screen for a link that was nearer 250.
     with db.pooled_read() as conn:
         server_now = conn.execute("SELECT clock_timestamp()").fetchone()[0]
     elapsed_ms = (time.perf_counter() - started) * 1000

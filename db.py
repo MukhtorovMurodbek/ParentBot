@@ -142,11 +142,14 @@ def _check_if_idle(conn) -> None:
     checkout -- including the checkout half a second after the last one, on a
     connection that could not possibly have gone stale in between.
 
-    That is most of them. This bot's database is in ap-northeast-2 and the
-    container is in EU West, so one round trip is a quarter of a second; the
-    check was a third of the cost of every read. A connection used within the
-    last POOL_CHECK_AFTER_IDLE seconds is taken as alive, and everything
-    quieter than that is still proved before use.
+    That is most of them. It cost a quarter of a second each back when this
+    bot's database was in ap-northeast-2 and the container in EU West -- a
+    third of the cost of every read. Since v1.2.0 the database is in
+    eu-central-1, beside the containers, which cuts the absolute cost by an
+    order of magnitude but leaves the ratio alone: the check is still a whole
+    extra round trip per read. A connection used within the last
+    POOL_CHECK_AFTER_IDLE seconds is taken as alive, and everything quieter
+    than that is still proved before use.
     """
     key = id(conn)
     now = time.monotonic()
