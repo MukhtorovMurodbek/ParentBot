@@ -432,6 +432,11 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         lines = ["Usage: /run &lt;bot&gt; &lt;command&gt; [args]", "", "<b>Bots:</b> " + bot_list_hint(), "", "<b>Commands:</b>"]
         lines += [f"  <code>{name}</code> — {desc}" for name, desc in family_link.COMMAND_HELP.items()]
+        # DownloaderBot registers one command of its own (see its bot.py), so
+        # it is not in this process's COMMAND_HELP. Listed by hand rather than
+        # left undiscoverable, since /run will happily dispatch it.
+        lines.append("  <code>probe</code> — DownloaderBot only: try every "
+                     "download route from inside its container")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
