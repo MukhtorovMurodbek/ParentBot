@@ -74,7 +74,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.1.2")
+VERSION = os.environ.get("FAMILY_VERSION", "1.1.3")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
