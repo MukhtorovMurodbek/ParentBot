@@ -74,7 +74,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.0.2")
+VERSION = os.environ.get("FAMILY_VERSION", "1.1.1")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -251,6 +251,10 @@ def init_family_schema() -> None:
 
 _listeners: list[asyncio.Task] = []
 _listening: dict[str, bool] = {}
+# Why the last attempt failed, for /status. A listener that cannot connect
+# is otherwise completely invisible: the bus keeps working off the safety
+# poll and the only symptom is that everything feels slow.
+_listen_error: dict[str, str] = {}
 
 LISTEN_RECONNECT_MIN = 2
 LISTEN_RECONNECT_MAX = 60
@@ -258,6 +262,11 @@ LISTEN_RECONNECT_MAX = 60
 
 def is_listening(channel: str) -> bool:
     return _listening.get(channel, False)
+
+
+def listen_error(channel: str) -> "str | None":
+    """Why this channel is not listening, if it is not."""
+    return _listen_error.get(channel)
 
 
 async def _listen_forever(channel: str, on_notify) -> None:
@@ -279,6 +288,7 @@ async def _listen_forever(channel: str, on_notify) -> None:
             )
             await aconn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(channel)))
             _listening[channel] = True
+            _listen_error.pop(channel, None)
             backoff = LISTEN_RECONNECT_MIN
             logger.info("Listening on %s -- the family bus is now push, not poll.", channel)
             # Whatever arrived while this connection was being (re-)made was
@@ -291,7 +301,11 @@ async def _listen_forever(channel: str, on_notify) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.info("Listener on %s dropped (%s); retrying in %ss.", channel, exc, backoff)
+            _listen_error[channel] = f"{type(exc).__name__}: {exc}"
+            # Warning rather than info: this is the difference between a
+            # bus that answers in milliseconds and one that answers in tens
+            # of seconds, and it used to be logged at a level nobody reads.
+            logger.warning("Listener on %s dropped (%s); retrying in %ss.", channel, exc, backoff)
         finally:
             _listening[channel] = False
             if aconn is not None:
@@ -493,17 +507,35 @@ async def _cmd_ping(context, args):
     return json.dumps(probe, separators=(",", ":")), None, None
 
 
+def _bus_line() -> str:
+    """A line about the family bus, but only when something is wrong with it.
+    A working listener says nothing: status output that reports everything is
+    status output nobody reads to the bottom of.
+
+    Worth reporting at all because a listener that never connects is otherwise
+    completely silent. The bus falls back to polling and keeps working, just
+    tens of times slower, and until now nothing anywhere said so."""
+    if not LISTEN_ENABLED:
+        return f"\nFamily bus: polling every {COMMAND_POLL_SECONDS}s (FAMILY_LISTEN=off)."
+    channel = command_channel(_bot_id or "")
+    if is_listening(channel):
+        return ""
+    why = listen_error(channel)
+    line = f"\n⚠️ Family bus: NOT listening -- on the {COMMAND_POLL_SECONDS}s fallback poll."
+    return line + (f"\n   Last error: {why}" if why else "")
+
+
 async def _cmd_status(context, args):
     sf = _monitoring()
     now = datetime.now(timezone.utc)
     hour = await _active_users_since(now - timedelta(hours=1))
     since_start = await _active_users_since(_start_time)
     if sf and hasattr(sf, "build_status_text"):
-        return sf.build_status_text(_start_time, hour, since_start), None, None
+        return sf.build_status_text(_start_time, hour, since_start) + _bus_line(), None, None
     return (
         f"Started: {_start_time:%Y-%m-%d %H:%M:%S UTC}\n"
         f"Active users (last hour): {hour}\n"
-        f"Active users (since start): {since_start}"
+        f"Active users (since start): {since_start}" + _bus_line()
     ), None, None
 
 
@@ -927,6 +959,31 @@ async def _poll_commands(context) -> None:
         await _run_one_command(context, row)
 
 
+# How long ago the safety net last actually looked. The interval used to be
+# chosen once, in attach(), from LISTEN_ENABLED -- which says whether a
+# listener was *wanted*, not whether one is connected. So a listener that
+# never came up left the queue on the 30-second idle poll for the life of the
+# process, and the only symptom was that the whole family bus felt slow:
+# commands taking half a minute to be picked up and results half a minute to
+# come back, with nothing anywhere saying why.
+#
+# Deciding it here instead makes the promise in UPDATES.md true. A listener
+# that drops puts the fast poll back within one tick, and one that recovers
+# takes the pressure off again, without either needing a restart.
+_last_poll_at = 0.0
+
+
+async def _safety_poll(context) -> None:
+    listening = LISTEN_ENABLED and is_listening(command_channel(_bot_id or ""))
+    due = COMMAND_IDLE_POLL_SECONDS if listening else COMMAND_POLL_SECONDS
+    global _last_poll_at
+    now = time.monotonic()
+    if now - _last_poll_at < due:
+        return
+    _last_poll_at = now
+    await _poll_commands(context)
+
+
 async def _send_heartbeat(context) -> None:
     try:
         await asyncio.to_thread(write_heartbeat)
@@ -1027,10 +1084,12 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
 
     app.job_queue.run_repeating(_send_heartbeat, interval=HEARTBEAT_SECONDS, first=HEARTBEAT_SECONDS)
 
-    # With a listener up, this job is the safety net and runs rarely. Without
-    # one it is the whole mechanism, and runs at the old 3-second cadence.
-    poll_every = COMMAND_IDLE_POLL_SECONDS if LISTEN_ENABLED else COMMAND_POLL_SECONDS
-    app.job_queue.run_repeating(_poll_commands, interval=poll_every, first=poll_every)
+    # Ticks at the fast cadence and decides each time whether to look --
+    # see _safety_poll. Scheduling the slow interval here is what made a
+    # dead listener cost thirty seconds a command until the next restart.
+    app.job_queue.run_repeating(
+        _safety_poll, interval=COMMAND_POLL_SECONDS, first=COMMAND_POLL_SECONDS
+    )
 
     if LISTEN_ENABLED:
         async def _wake():
@@ -1054,7 +1113,8 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
     logger.info(
         "Family bus on: heartbeat every %ss, commands %s, tidy-up every %ss.",
         HEARTBEAT_SECONDS,
-        f"pushed over LISTEN (with a {poll_every}s safety poll)" if LISTEN_ENABLED
-        else f"polled every {poll_every}s",
+        f"pushed over LISTEN, falling back to a {COMMAND_POLL_SECONDS}s poll "
+        f"whenever the listener is down" if LISTEN_ENABLED
+        else f"polled every {COMMAND_POLL_SECONDS}s",
         HOUSEKEEPING_SECONDS,
     )
