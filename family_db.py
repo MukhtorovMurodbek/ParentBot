@@ -48,8 +48,19 @@ from pathlib import Path
 
 import psycopg
 
-# Schemas that belong to Postgres itself rather than to the family.
-SYSTEM_SCHEMAS = ("information_schema",)
+# Schemas that belong to Postgres itself, or to the Supabase platform,
+# rather than to the family. The Supabase-managed ones are recreated per
+# project, are never the family's own data, and several of them carry
+# things this CSV-merge tool cannot round-trip -- generated columns
+# (auth.identities.email) and views exposed as tables (vault.secrets).
+# list_tables() also always skips pg_% and supabase_%.
+SYSTEM_SCHEMAS = (
+    "information_schema",
+    "auth", "storage", "realtime", "_realtime", "vault",
+    "pgsodium", "pgsodium_masks", "extensions",
+    "graphql", "graphql_public", "pgbouncer",
+    "cron", "net", "_analytics", "_supabase",
+)
 
 COPY_OPTS = "FORMAT CSV, HEADER, NULL '\\N'"
 
@@ -88,6 +99,7 @@ def list_tables(conn, schemas: list[str] | None = None) -> list[tuple[str, str]]
         # %% rather than %: this statement carries parameters, so psycopg reads
         # a bare % as the start of a placeholder.
         "WHERE table_type = 'BASE TABLE' AND table_schema NOT LIKE 'pg\\_%%' "
+        "AND table_schema NOT LIKE 'supabase\\_%%' "
         "AND table_schema <> ALL(%s)"
     )
     params: list = [list(SYSTEM_SCHEMAS)]
@@ -102,7 +114,13 @@ def list_tables(conn, schemas: list[str] | None = None) -> list[tuple[str, str]]
 def columns_of(conn, schema: str, table: str) -> list[str]:
     cur = conn.execute(
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+        "WHERE table_schema = %s AND table_name = %s "
+        # A generated column cannot appear in a COPY column list (either
+        # direction), and a STORED one is recomputed on insert anyway, so
+        # dropping it from both the backup and the restore is necessary and
+        # lossless. Supabase's auth.identities.email is the one that bites.
+        "AND is_generated = 'NEVER' "
+        "ORDER BY ordinal_position",
         (schema, table),
     )
     return [row[0] for row in cur.fetchall()]

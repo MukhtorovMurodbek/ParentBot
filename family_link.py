@@ -34,8 +34,9 @@ Three things flow over this bus:
      ParentBot polls for undelivered ones and forwards them as a DM.
 
   3. **Commands** -- ParentBot inserts a row in family.commands aimed at
-     one bot; that bot picks it up within COMMAND_POLL_SECONDS, runs it,
-     and writes the answer back into the same row. This is how ParentBot
+     one bot; that bot polls for it (fast while the bus is busy, every
+     FAMILY_BUS_POLL_IDLE_SECONDS otherwise), runs it, and writes the answer
+     back into the same row. This is how ParentBot
      runs another bot's owner-only commands (/status, /dbdump, /whois,
      /messageas, ...) without either process needing to reach the other
      over the network. A command aimed at a bot that is down simply stays
@@ -74,67 +75,54 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.1.3")
+VERSION = os.environ.get("FAMILY_VERSION", "1.1.4")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
 # How a bot finds out there is a command waiting for it
 # ---------------------------------------------------------------------------
-# This used to be a poll, every 3 seconds, forever. Five bots asking an
-# otherwise idle database "anything for me?" 1,200 times an hour each is
-# 144,000 queries a day whose honest answer, virtually every time, is no --
-# and the one time it is yes, the answer is still up to 3 seconds late.
+# It polls family.commands for its own pending rows. There is no push.
 #
-# Postgres already has the right primitive. The writer NOTIFYs the target
-# bot's channel inside the same transaction as the INSERT; the target is
-# sitting in LISTEN and hears it in single-digit milliseconds. No polling, no
-# delay, and it is the same connection either way -- LISTEN needs one held
-# open, which is exactly what the pool's min_size=1 was already holding.
+# v1.0.1 added a LISTEN/NOTIFY layer on top of the poll: a dedicated
+# psycopg.AsyncConnection per channel, an asyncio task holding it open, its
+# own reconnect/backoff. It was meant to turn "picked up within the poll
+# interval" into "picked up in milliseconds". In practice it earned its
+# reputation as the most fragile code in the family: the job that started it
+# was silently misfire-dropped and never ran on any bot for two months
+# (v1.1.2), and psycopg's async connection cannot run on Windows' default
+# event loop at all, so it never worked on the laptop the bots are developed
+# on. Both times the poll underneath carried the whole bus and nobody
+# noticed. For a bus with one human operator typing /ping now and then, a
+# held connection and 200 lines of reconnect logic bought a few seconds on a
+# manual command. v1.1.4 deleted it.
 #
-# The poll is still here, at a much slower interval, as the safety net: a
-# NOTIFY is delivered at most once and only to a connection that is listening
-# at that moment, so a listener that dropped between the notify and its own
-# reconnect would otherwise never learn about a queued command. When the
-# listener is off or cannot connect, the interval drops back to the old 3
-# seconds and the bus behaves exactly as it used to.
-#
-# One requirement worth naming: LISTEN/NOTIFY is a session feature, so this
-# needs the *session* pooler (port 5432). db.py already warns about port 6543
-# for the same underlying reason.
-LISTEN_ENABLED = os.environ.get("FAMILY_LISTEN", "on").lower() not in ("off", "0", "false", "no")
-COMMAND_POLL_SECONDS = int(os.environ.get("FAMILY_COMMAND_POLL_SECONDS", "3"))
-COMMAND_IDLE_POLL_SECONDS = int(os.environ.get("FAMILY_COMMAND_IDLE_POLL_SECONDS", "30"))
-
-COMMAND_CHANNEL_PREFIX = "family_cmd_"
-RESULT_CHANNEL = "family_result"
-EVENT_CHANNEL = "family_event"
+# What is left is one poll, made adaptive: fast right after the bus was last
+# busy, slow when it has been quiet. mark_bus_active() opens a short fast
+# window; anything that expects bus traffic (a command just queued, claimed
+# or finished) calls it. The result: a warm bus answers in about a second,
+# and a cold one within FAMILY_BUS_POLL_IDLE_SECONDS. It behaves identically
+# on a Windows laptop and on Railway, and it has no failure mode short of the
+# database itself being unreachable -- which /status shows anyway.
+BUS_POLL_ACTIVE_SECONDS = float(os.environ.get("FAMILY_BUS_POLL_ACTIVE_SECONDS", "1"))
+BUS_POLL_IDLE_SECONDS = float(os.environ.get("FAMILY_BUS_POLL_IDLE_SECONDS", "10"))
+# How long the fast cadence lasts after the last time the bus did something.
+BUS_ACTIVE_WINDOW_SECONDS = float(os.environ.get("FAMILY_BUS_ACTIVE_WINDOW_SECONDS", "20"))
 
 # Pass to every job_queue.run_once(..., when=0) in the family.
 #
 # APScheduler drops a job whose run time has already passed by more than
 # misfire_grace_time, which defaults to one second, and python-telegram-bot
-# does not override it. attach() runs inside main(), so "now" is stamped
-# before run_polling() starts the scheduler -- and between those two moments
-# sits post_init: an advisory lock, the waitlist table, the maintenance flag
-# and set_my_commands, each a round trip to a database on another continent.
-# Several seconds, every time.
-#
-# So the job that starts the LISTEN listener was scheduled, silently
-# discarded as a misfire, and never ran. Not once, on any bot, since the
-# listener shipped in v1.0.1 -- which is why every /status said "NOT
-# listening" with no error to show for it, and why a command that should have
-# been pushed in milliseconds waited for a poll instead. `None` means "run it
-# however late it is", which for a job that only ever means "do this as soon
-# as the loop is up" is the only correct setting.
+# does not override it. A bot's main() stamps "now" before run_polling()
+# starts the scheduler -- and between those two moments sits post_init: an
+# advisory lock, the waitlist table, the maintenance flag and set_my_commands,
+# each a round trip to a database on another continent. Several seconds, every
+# time. So a run_once(when=0) job would be scheduled, silently discarded as a
+# misfire, and never run (this is exactly how the old LISTEN listener stayed
+# dead for two months -- see v1.1.2). `None` means "run it however late it
+# is", which for a job that only ever means "do this as soon as the loop is
+# up" is the only correct setting.
 RUN_LATE = {"misfire_grace_time": None}
-
-
-def command_channel(bot_id: str) -> str:
-    """The channel one bot listens on. ParentBot's db.py NOTIFYs the same
-    name when it queues a command -- the prefix is duplicated there rather
-    than imported, because db.py is what this module imports."""
-    return COMMAND_CHANNEL_PREFIX + bot_id
 
 # Set by attach(); everything below no-ops until then.
 _bot_id: str | None = None
@@ -257,117 +245,30 @@ def init_family_schema() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The listener
+# The adaptive poll
 # ---------------------------------------------------------------------------
-# One asyncio task per channel, holding its own connection (a pooled one is
-# handed back after every query, and a LISTEN goes back with it). It
-# reconnects on its own with a backoff, and a poll of the queue happens
-# immediately after every reconnect -- a notify sent while nobody was
-# listening is gone, and that gap is exactly where it would have been sent.
-#
-# Nothing here can break the bot: every failure path ends in "log it, sleep,
-# try again", and the slow poll behind it keeps working throughout.
+# One timer, ticking every BUS_POLL_ACTIVE_SECONDS, that decides on each tick
+# whether this is also a database poll: always while the bus is "active",
+# otherwise once per BUS_POLL_IDLE_SECONDS. mark_bus_active() opens a fresh
+# active window and is called by anything that has reason to expect bus
+# traffic in the next few seconds -- a command just queued, claimed, or
+# finished. So a bus that is doing something polls at ~1s and one that has
+# been quiet for a while polls at ~10s, with no held connection and no state
+# machine to get wrong.
 
-_listeners: list[asyncio.Task] = []
-_listening: dict[str, bool] = {}
-# Why the last attempt failed, for /status. A listener that cannot connect
-# is otherwise completely invisible: the bus keeps working off the safety
-# poll and the only symptom is that everything feels slow.
-_listen_error: dict[str, str] = {}
-
-LISTEN_RECONNECT_MIN = 2
-LISTEN_RECONNECT_MAX = 60
+_bus_active_until = 0.0   # monotonic; poll fast while time.monotonic() < this
 
 
-def is_listening(channel: str) -> bool:
-    return _listening.get(channel, False)
+def mark_bus_active() -> None:
+    """Poll at the fast cadence for the next BUS_ACTIVE_WINDOW_SECONDS. Cheap
+    and idempotent -- call it whenever bus traffic is likely (a command was
+    just written, picked up, or answered)."""
+    global _bus_active_until
+    _bus_active_until = time.monotonic() + BUS_ACTIVE_WINDOW_SECONDS
 
 
-def listen_error(channel: str) -> "str | None":
-    """Why this channel is not listening, if it is not."""
-    return _listen_error.get(channel)
-
-
-async def _listen_forever(channel: str, on_notify) -> None:
-    import psycopg
-    from psycopg import sql
-
-    backoff = LISTEN_RECONNECT_MIN
-    while True:
-        aconn = None
-        try:
-            # Keepalives, because this connection's whole job is to sit
-            # there saying nothing: a LISTEN that has been silently dropped
-            # by a load balancer's idle timeout looks exactly like a LISTEN
-            # with nothing to report, and would stay "connected" until the
-            # next notification failed to arrive.
-            aconn = await psycopg.AsyncConnection.connect(
-                db.DATABASE_URL, autocommit=True,
-                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
-            )
-            await aconn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(channel)))
-            _listening[channel] = True
-            _listen_error.pop(channel, None)
-            backoff = LISTEN_RECONNECT_MIN
-            logger.info("Listening on %s -- the family bus is now push, not poll.", channel)
-            # Whatever arrived while this connection was being (re-)made was
-            # notified to nobody, so look once before settling in to wait.
-            await on_notify()
-            async for _ in aconn.notifies():
-                await on_notify()
-            # notifies() returning means the connection ended; fall through
-            # to the reconnect below rather than treating it as a stop.
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _listen_error[channel] = f"{type(exc).__name__}: {exc}"
-            # Warning rather than info: this is the difference between a
-            # bus that answers in milliseconds and one that answers in tens
-            # of seconds, and it used to be logged at a level nobody reads.
-            logger.warning("Listener on %s dropped (%s); retrying in %ss.", channel, exc, backoff)
-        finally:
-            _listening[channel] = False
-            if aconn is not None:
-                try:
-                    await aconn.close()
-                except Exception:
-                    pass
-        try:
-            await asyncio.sleep(backoff)
-        except asyncio.CancelledError:
-            raise
-        backoff = min(backoff * 2, LISTEN_RECONNECT_MAX)
-
-
-def listen_for(channel: str, on_notify) -> None:
-    """Start a listener. `on_notify` is an async callable taking no arguments
-    -- called once per notification, and once more after every reconnect.
-
-    Must be called with the event loop running (from post_init, or from a
-    run_once job): attach() itself runs before run_polling() has started one.
-    """
-    if not LISTEN_ENABLED:
-        return
-    _listeners.append(asyncio.get_running_loop().create_task(_listen_forever(channel, on_notify)))
-
-
-def stop_listening() -> None:
-    for task in _listeners:
-        task.cancel()
-    _listeners.clear()
-    _listening.clear()
-
-
-def notify(channel: str, payload: str = "") -> None:
-    """Blocking; call through asyncio.to_thread from async code. Best-effort
-    -- a notification that does not go out costs one slow poll's worth of
-    delay, not a lost command."""
-    try:
-        with _connect() as conn:
-            conn.execute("SELECT pg_notify(%s, %s)", (channel, payload[:7000]))
-            conn.commit()
-    except Exception:
-        logger.debug("Could not notify %s", channel, exc_info=True)
+def bus_is_active() -> bool:
+    return time.monotonic() < _bus_active_until
 
 
 def db_round_trip_ms() -> float:
@@ -438,11 +339,11 @@ def report_event(level: str, kind: str, message: str, details: str | None = None
             f"VALUES (%s, %s, %s, %s, %s)",
             (_bot_id, level, kind, message[:4000], (details or "")[:8000] or None),
         )
-        # In the same transaction, so ParentBot cannot wake to an event that
-        # is not visible yet. A crash reported this way reaches the owner in
-        # about as long as the round trip takes, rather than on the next poll.
-        conn.execute("SELECT pg_notify(%s, %s)", (EVENT_CHANNEL, _bot_id or ""))
         conn.commit()
+    # ParentBot picks this up on its event pump's next pass -- fast, because a
+    # bot reporting an event is usually in the middle of something the bus
+    # cares about, and the pump runs its active cadence whenever ParentBot has
+    # recently been busy.
 
 
 def report_event_soon(level: str, kind: str, message: str, details: str | None = None) -> None:
@@ -514,7 +415,6 @@ def ping_probe() -> dict:
         "where": _where_am_i(),
         "version": VERSION,
         "pid": os.getpid(),
-        "listen": is_listening(command_channel(_bot_id or "")),
     }
 
 
@@ -532,35 +432,17 @@ async def _cmd_ping(context, args):
     return json.dumps(probe, separators=(",", ":")), None, None
 
 
-def _bus_line() -> str:
-    """A line about the family bus, but only when something is wrong with it.
-    A working listener says nothing: status output that reports everything is
-    status output nobody reads to the bottom of.
-
-    Worth reporting at all because a listener that never connects is otherwise
-    completely silent. The bus falls back to polling and keeps working, just
-    tens of times slower, and until now nothing anywhere said so."""
-    if not LISTEN_ENABLED:
-        return f"\nFamily bus: polling every {COMMAND_POLL_SECONDS}s (FAMILY_LISTEN=off)."
-    channel = command_channel(_bot_id or "")
-    if is_listening(channel):
-        return ""
-    why = listen_error(channel)
-    line = f"\n⚠️ Family bus: NOT listening -- on the {COMMAND_POLL_SECONDS}s fallback poll."
-    return line + (f"\n   Last error: {why}" if why else "")
-
-
 async def _cmd_status(context, args):
     sf = _monitoring()
     now = datetime.now(timezone.utc)
     hour = await _active_users_since(now - timedelta(hours=1))
     since_start = await _active_users_since(_start_time)
     if sf and hasattr(sf, "build_status_text"):
-        return sf.build_status_text(_start_time, hour, since_start) + _bus_line(), None, None
+        return sf.build_status_text(_start_time, hour, since_start), None, None
     return (
         f"Started: {_start_time:%Y-%m-%d %H:%M:%S UTC}\n"
         f"Active users (last hour): {hour}\n"
-        f"Active users (since start): {since_start}" + _bus_line()
+        f"Active users (since start): {since_start}"
     ), None, None
 
 
@@ -935,12 +817,11 @@ def _finish_command(command_id: int, ok: bool, output: str, file_name, file_byte
             """,
             ("done" if ok else "failed", ok, output[:60000], file_name, file_bytes, command_id),
         )
-        # Same transaction as the write, so ParentBot cannot be woken to
-        # find a row that is not there yet. This is what turns its
-        # result_pump from a 3-second poll into something that fires the
-        # instant an answer exists.
-        conn.execute("SELECT pg_notify(%s, %s)", (RESULT_CHANNEL, str(command_id)))
         conn.commit()
+    # ParentBot's result pump collects this on its next pass. That pass is at
+    # the fast cadence: ParentBot marked the bus active when it queued the
+    # command, so the whole time an answer could be coming back it is looking
+    # about once a second.
 
 
 async def _run_one_command(context, row) -> None:
@@ -963,49 +844,47 @@ async def _run_one_command(context, row) -> None:
         logger.exception("Could not write the result of family command %s back", command_id)
 
 
-# One notification does not mean one command: several can be queued between
-# two wake-ups (a /ping to everything, a bot that was down catching up), and
-# with the fallback poll now 30s apart rather than 3, leaving the rest for
-# "next time" would mean half a minute each. Drain instead. The ceiling is
-# there so that a queue somebody filled by accident cannot monopolise the
-# event loop -- what is left waits for the next pass, which is immediate.
+# One pass does not mean one command: several can be queued between two ticks
+# (a /ping to everything, a bot that was down catching up), so drain rather
+# than leave the rest for "next time". The ceiling is there so that a queue
+# somebody filled by accident cannot monopolise the event loop -- what is left
+# waits for the next tick, which is immediate while the bus is active.
 MAX_COMMANDS_PER_PASS = int(os.environ.get("FAMILY_MAX_COMMANDS_PER_PASS", "10"))
 
 
 async def _poll_commands(context) -> None:
+    ran = 0
     for _ in range(MAX_COMMANDS_PER_PASS):
         try:
             row = await asyncio.to_thread(_claim_next_command)
         except Exception:
             logger.debug("Family command poll failed (database unreachable?)", exc_info=True)
-            return
+            break
         if not row:
-            return
+            break
         await _run_one_command(context, row)
+        ran += 1
+    if ran:
+        # Commands cluster -- one arriving means another probably is too.
+        # Keep looking at the fast cadence for a while.
+        mark_bus_active()
 
 
-# How long ago the safety net last actually looked. The interval used to be
-# chosen once, in attach(), from LISTEN_ENABLED -- which says whether a
-# listener was *wanted*, not whether one is connected. So a listener that
-# never came up left the queue on the 30-second idle poll for the life of the
-# process, and the only symptom was that the whole family bus felt slow:
-# commands taking half a minute to be picked up and results half a minute to
-# come back, with nothing anywhere saying why.
-#
-# Deciding it here instead makes the promise in UPDATES.md true. A listener
-# that drops puts the fast poll back within one tick, and one that recovers
-# takes the pressure off again, without either needing a restart.
-_last_poll_at = 0.0
+# _bus_tick fires every BUS_POLL_ACTIVE_SECONDS and decides whether this tick
+# is also a database poll: always while the bus is active, otherwise once per
+# BUS_POLL_IDLE_SECONDS. This is the whole delivery mechanism -- there is no
+# push behind it any more -- so it is deliberately simple and has nothing that
+# can be "down".
+_last_bus_poll_at = 0.0
 
 
-async def _safety_poll(context) -> None:
-    listening = LISTEN_ENABLED and is_listening(command_channel(_bot_id or ""))
-    due = COMMAND_IDLE_POLL_SECONDS if listening else COMMAND_POLL_SECONDS
-    global _last_poll_at
+async def _bus_tick(context) -> None:
+    global _last_bus_poll_at
+    due = BUS_POLL_ACTIVE_SECONDS if bus_is_active() else BUS_POLL_IDLE_SECONDS
     now = time.monotonic()
-    if now - _last_poll_at < due:
+    if now - _last_bus_poll_at < due:
         return
-    _last_poll_at = now
+    _last_bus_poll_at = now
     await _poll_commands(context)
 
 
@@ -1109,37 +988,22 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
 
     app.job_queue.run_repeating(_send_heartbeat, interval=HEARTBEAT_SECONDS, first=HEARTBEAT_SECONDS)
 
-    # Ticks at the fast cadence and decides each time whether to look --
-    # see _safety_poll. Scheduling the slow interval here is what made a
-    # dead listener cost thirty seconds a command until the next restart.
+    # The command bus. One repeating tick at the fast cadence; _bus_tick
+    # decides on each one whether to actually poll (always while the bus is
+    # active, otherwise every BUS_POLL_IDLE_SECONDS).
     app.job_queue.run_repeating(
-        _safety_poll, interval=COMMAND_POLL_SECONDS, first=COMMAND_POLL_SECONDS
+        _bus_tick, interval=BUS_POLL_ACTIVE_SECONDS, first=BUS_POLL_ACTIVE_SECONDS
     )
-
-    if LISTEN_ENABLED:
-        async def _wake():
-            # Through the job queue rather than called directly: that is what
-            # builds the CallbackContext the command handlers are written
-            # against, and it keeps one command on the same path whether it
-            # arrived by notify or by poll.
-            app.job_queue.run_once(_poll_commands, when=0, job_kwargs=RUN_LATE)
-
-        async def _start_listener(_context):
-            # A run_once job rather than a call from here: attach() runs
-            # inside main(), before run_polling() has an event loop to
-            # create a task on.
-            listen_for(command_channel(bot_id), _wake)
-
-        app.job_queue.run_once(_start_listener, when=0, job_kwargs=RUN_LATE)
+    # A bot that has just started is usually about to be pinged by ParentBot's
+    # roll-call, so open with the fast cadence rather than making that first
+    # command wait a full idle interval.
+    mark_bus_active()
 
     # First pass a minute in rather than at startup, so a restart loop cannot
     # turn into a delete storm.
     app.job_queue.run_repeating(_housekeeping, interval=HOUSEKEEPING_SECONDS, first=60)
     logger.info(
-        "Family bus on: heartbeat every %ss, commands %s, tidy-up every %ss.",
-        HEARTBEAT_SECONDS,
-        f"pushed over LISTEN, falling back to a {COMMAND_POLL_SECONDS}s poll "
-        f"whenever the listener is down" if LISTEN_ENABLED
-        else f"polled every {COMMAND_POLL_SECONDS}s",
-        HOUSEKEEPING_SECONDS,
+        "Family bus on: heartbeat every %ss, commands polled (%ss busy / %ss idle), "
+        "tidy-up every %ss.",
+        HEARTBEAT_SECONDS, BUS_POLL_ACTIVE_SECONDS, BUS_POLL_IDLE_SECONDS, HOUSEKEEPING_SECONDS,
     )

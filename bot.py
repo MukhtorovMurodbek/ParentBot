@@ -93,21 +93,17 @@ DOWN_AFTER_SECONDS = int(os.environ.get("PBOT_DOWN_AFTER_SECONDS", "120"))
 # and says so.
 COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PBOT_COMMAND_TIMEOUT_SECONDS", "90"))
 
-# How often the result and event queues are swept when nothing has woken
-# them. Both are pushed over LISTEN/NOTIFY now (see family_link.py), so these
-# only matter for a notification that arrived while a listener was
-# reconnecting. Set FAMILY_LISTEN=off to go back to polling as the primary
-# mechanism, in which case drop these back to 3 and 20.
-RESULT_POLL_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_SECONDS", "30"))
-EVENT_POLL_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_SECONDS", "60"))
-# What the two backstops fall back to while their listener is NOT connected.
-# The intervals above are for when it is, and are deliberately lazy; these are
-# what stand in for it, and they have to be quick enough that a bus running on
-# them is merely slower rather than visibly broken.
-RESULT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_FAST_SECONDS", "2"))
-EVENT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_FAST_SECONDS", "10"))
-# How often the backstops tick to make that decision.
-PUMP_TICK_SECONDS = int(os.environ.get("PBOT_PUMP_TICK_SECONDS", "2"))
+# How ParentBot collects command results and child-bot events: the same
+# adaptive poll the child bots use for the command queue (family_link._bus_tick).
+# One fast tick decides each time whether to sweep -- every FAST interval while
+# the bus is active (family_link.bus_is_active(), which ParentBot sets the
+# moment it queues a command), every SLOW interval once it has gone quiet.
+RESULT_POLL_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_SECONDS", "20"))
+EVENT_POLL_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_SECONDS", "30"))
+RESULT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_FAST_SECONDS", "1"))
+EVENT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_FAST_SECONDS", "2"))
+# How often the pumps tick to make that decision.
+PUMP_TICK_SECONDS = int(os.environ.get("PBOT_PUMP_TICK_SECONDS", "1"))
 
 # A redeploy makes a bot's heartbeat stale exactly the way a crash does, and
 # for the first minute of it there is no way to tell them apart from the
@@ -524,11 +520,6 @@ def _describe_end(name: str, where: str, probe: dict) -> str:
     skew = probe.get("skew_ms", 0)
     bits = [f"Supabase {_ms(probe.get('db_ms', 0)).strip()} per query",
             f"clock {skew:+.0f} ms"]
-    # "polling" means this end's LISTEN is down and it is finding work on a
-    # timer instead. Worth saying loudly: it is the difference between a bus
-    # that answers in milliseconds and one that answers in tens of seconds,
-    # and it is invisible from anywhere else.
-    bits.append("push (LISTEN)" if probe.get("listen") else "⚠️ polling — LISTEN down")
     return f"{name}\n  {where}\n  " + " · ".join(bits)
 
 
@@ -1009,6 +1000,11 @@ async def event_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         return
 
+    if events:
+        # A crashing bot tends to report several things at once; stay on the
+        # fast cadence long enough to catch the rest.
+        family_link.mark_bus_active()
+
     icons = {"warning": "⚠️", "error": "🔥", "critical": "🚨", "info": "ℹ️"}
     for event in events:
         if event["level"] not in ALERT_LEVELS and event["kind"] != "payment":
@@ -1024,17 +1020,16 @@ async def event_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_owner(context, text[:4000])
 
 
-# How long ago each backstop actually looked. Same shape as the child bots'
-# _safety_poll: the interval is chosen from whether a listener is *connected*,
-# not from whether one was wanted, so a listener that drops puts the fast poll
-# back within one tick and one that recovers takes the pressure off again --
-# neither needing a restart, and neither depending on anybody noticing.
+# How long ago each pump actually swept. The interval is chosen from whether
+# the bus is active (family_link.bus_is_active(), set when ParentBot queues a
+# command): fast while an answer could be coming back, slow once things have
+# gone quiet -- the same adaptive poll the child bots run for the command
+# queue, and the whole delivery mechanism now that there is no push.
 _last_pumped = {"result": 0.0, "event": 0.0}
 
 
-async def _backstop(context, key: str, channel: str, pump, fast: int, idle: int) -> None:
-    listening = family_link.LISTEN_ENABLED and family_link.is_listening(channel)
-    due = idle if listening else fast
+async def _pump_if_due(context, key: str, pump, fast: int, idle: int) -> None:
+    due = fast if family_link.bus_is_active() else idle
     now = time_module.monotonic()
     if now - _last_pumped[key] < due:
         return
@@ -1043,13 +1038,13 @@ async def _backstop(context, key: str, channel: str, pump, fast: int, idle: int)
 
 
 async def _result_backstop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _backstop(context, "result", family_link.RESULT_CHANNEL, result_pump,
-                    RESULT_POLL_FAST_SECONDS, RESULT_POLL_SECONDS)
+    await _pump_if_due(context, "result", result_pump,
+                       RESULT_POLL_FAST_SECONDS, RESULT_POLL_SECONDS)
 
 
 async def _event_backstop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _backstop(context, "event", family_link.EVENT_CHANNEL, event_pump,
-                    EVENT_POLL_FAST_SECONDS, EVENT_POLL_SECONDS)
+    await _pump_if_due(context, "event", event_pump,
+                       EVENT_POLL_FAST_SECONDS, EVENT_POLL_SECONDS)
 
 
 async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1059,6 +1054,11 @@ async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
         results = await asyncio.to_thread(db.take_finished_commands, 5)
     except Exception:
         return
+
+    if results:
+        # More may still be trickling in (a /ping to everything answers over
+        # a few seconds); keep sweeping at the fast cadence for a bit.
+        family_link.mark_bus_active()
 
     for result in results:
         # A /ping is answered by rewriting the message that announced it,
@@ -1466,37 +1466,21 @@ def main():
     # family.bot_state and the watchdog has nothing left to announce.
     app.job_queue.run_once(startup_rollcall, when=STARTUP_ROLLCALL_SECONDS)
     app.job_queue.run_repeating(watchdog, interval=60, first=20)
-    # Both pumps used to be the whole delivery mechanism, and were fast for
-    # that reason: 20s and 3s, forever, mostly to find nothing. Both are now
-    # woken by the writer over LISTEN/NOTIFY the moment there is something to
-    # collect, so these intervals are the safety net for a notification that
-    # was sent while nobody happened to be listening.
-    #
-    # They tick fast and decide each time whether to look, the way the child
-    # bots' own safety poll has since v1.0.5 -- because "the listener is up"
-    # was an assumption rather than a fact, and when it was wrong the backstop
-    # WAS the delivery mechanism. Thirty seconds of it, per command, with
-    # nothing anywhere saying so.
+    # ParentBot collects command results and child-bot events on the same
+    # adaptive poll the child bots run for the command queue: a fast tick that
+    # decides each time whether to sweep -- every *_POLL_FAST_SECONDS while the
+    # bus is active (set the moment ParentBot queues a command), every
+    # *_POLL_SECONDS once it has gone quiet. There is no push behind it, so
+    # there is nothing to be "down": a pump that is late is late by one idle
+    # interval, not by the life of the process.
     app.job_queue.run_repeating(_event_backstop, interval=PUMP_TICK_SECONDS, first=10)
     app.job_queue.run_repeating(_result_backstop, interval=PUMP_TICK_SECONDS, first=5)
 
-    async def _wake_results():
-        app.job_queue.run_once(result_pump, when=0, job_kwargs=family_link.RUN_LATE)
-
-    async def _wake_events():
-        app.job_queue.run_once(event_pump, when=0, job_kwargs=family_link.RUN_LATE)
-
-    async def _start_listeners(_context):
-        # From a job rather than from here: main() has no running event loop
-        # to create tasks on until run_polling() starts one.
-        family_link.listen_for(family_link.RESULT_CHANNEL, _wake_results)
-        family_link.listen_for(family_link.EVENT_CHANNEL, _wake_events)
-
-    # RUN_LATE, or this never runs at all -- see family_link.RUN_LATE. This is
-    # the job that starts both listeners, so losing it is what turned every
-    # /ping into a wait for the 30-second result poll: 24 of the 27 seconds
-    # the owner saw were ParentBot's own backstop timer, not the bus.
-    app.job_queue.run_once(_start_listeners, when=0, job_kwargs=family_link.RUN_LATE)
+    # One sweep of each at startup -- however late the job queue actually
+    # starts (see family_link.RUN_LATE) -- to clear anything a previous run
+    # left queued before the first tick falls due.
+    app.job_queue.run_once(result_pump, when=0, job_kwargs=family_link.RUN_LATE)
+    app.job_queue.run_once(event_pump, when=0, job_kwargs=family_link.RUN_LATE)
     if DIGEST_AT_UTC:
         hour, _, minute = DIGEST_AT_UTC.partition(":")
         app.job_queue.run_daily(

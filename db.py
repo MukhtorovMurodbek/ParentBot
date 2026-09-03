@@ -97,11 +97,6 @@ def check_database_url(dsn: str = DATABASE_URL) -> list[str]:
 
 FAMILY_SCHEMA = "family"
 
-# Must match family_link.command_channel(). Duplicated rather than imported
-# because family_link imports *this* module, and the alternative is a cycle
-# for the sake of one string.
-COMMAND_CHANNEL_PREFIX = "family_cmd_"
-
 
 # ---------------------------------------------------------------------------
 # One pooled connection per process
@@ -396,13 +391,13 @@ def log_event(bot_id: str, level: str, kind: str, message: str) -> None:
 
 def queue_command(target_bot: str, command: str, args: str, requested_by: int,
                   reply_chat_id: int) -> int:
-    """Queue one command and wake its target.
+    """Queue one command for a bot to pick up.
 
-    The NOTIFY rides the same transaction as the INSERT, so the target bot
-    cannot be woken to find a row that is not committed yet. It is what turns
-    a command from "picked up within the next poll" into "picked up in
-    milliseconds"; a bot that is not listening still finds it on its next
-    safety poll, so nothing depends on the notification arriving.
+    The target finds it on its next bus poll -- about a second if the bus is
+    already busy, at most FAMILY_BUS_POLL_IDLE_SECONDS if it has been quiet
+    (see family_link._bus_tick). The caller should call
+    family_link.mark_bus_active() right after this so ParentBot's own result
+    pump goes to the fast cadence while the answer is on its way back.
     """
     with pooled() as conn:
         cur = conn.execute(
@@ -413,9 +408,17 @@ def queue_command(target_bot: str, command: str, args: str, requested_by: int,
             (target_bot, command, args, requested_by, reply_chat_id),
         )
         command_id = cur.fetchone()[0]
-        conn.execute("SELECT pg_notify(%s, %s)", (COMMAND_CHANNEL_PREFIX + target_bot, str(command_id)))
         conn.commit()
-        return command_id
+    # One choke point for every /ping, /run, /pause, ... so ParentBot's result
+    # pump goes to its fast cadence the instant a command is outstanding,
+    # without each call site having to remember to say so. Imported here
+    # rather than at module scope because family_link imports this module.
+    try:
+        import family_link
+        family_link.mark_bus_active()
+    except Exception:
+        logging.getLogger(__name__).debug("Could not mark the family bus active", exc_info=True)
+    return command_id
 
 
 def take_finished_commands(limit: int = 5) -> list[dict]:

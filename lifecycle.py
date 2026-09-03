@@ -954,10 +954,4 @@ async def on_stop(application) -> None:
             logger.info("In-progress state saved -- the next start picks it up.")
         except Exception:
             logger.warning("Could not save in-progress state on the way out.", exc_info=True)
-    try:
-        import family_link
-
-        family_link.stop_listening()
-    except Exception:
-        logger.debug("Could not stop the family listener", exc_info=True)
     release_lease()
