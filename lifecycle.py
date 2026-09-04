@@ -60,9 +60,31 @@ logger = logging.getLogger(__name__)
 ENABLED = os.environ.get("DEPLOY_SAFETY", "on").lower() not in ("off", "0", "false", "no")
 
 # How long a starting process waits for a previous one to let go of the poll
-# lease before it starts anyway. Longer than any graceful shutdown should
-# take, shorter than anyone will wait for a bot to come back.
-LEASE_WAIT_SECONDS = float(os.environ.get("DEPLOY_LEASE_WAIT_SECONDS", "45"))
+# lease before it starts anyway.
+#
+# Raised from 45s to 240s in v1.2.2R, when railway.json's overlapSeconds went
+# from 0 to 30. Those two numbers are one decision, not two.
+#
+# overlapSeconds: 0 meant Railway stopped the old container before starting
+# the new one, so the bot was away for the whole of the new container's build
+# and boot -- a minute or three during which every message waited. Telegram
+# holds those updates and hands them over afterwards, so nothing was ever
+# lost; what it cost was a user typing into what looked like a dead bot.
+#
+# With this lease in place, the old container can keep serving while the new
+# one builds and boots. The new one blocks HERE, in post_init -- before its
+# first getUpdates, before its first heartbeat -- until Railway stops the old
+# one and Postgres releases its session-level lock. The gap becomes the drain
+# alone, which is seconds.
+#
+# The wait therefore has to outlast the whole handover: the overlap window
+# (30s) plus a worst-case drain (drainingSeconds, 120s), with room to spare.
+# If it does not, the new container gives up and starts polling while the old
+# one is still going, and Telegram answers 409 Conflict and splits the
+# updates between them -- which is the exact failure overlapSeconds: 0
+# existed to prevent. Keep DEPLOY_LEASE_WAIT_SECONDS comfortably above
+# overlapSeconds + drainingSeconds if either is ever changed.
+LEASE_WAIT_SECONDS = float(os.environ.get("DEPLOY_LEASE_WAIT_SECONDS", "240"))
 
 # State older than this is not loaded at startup, and is deleted when it is
 # noticed. Matches shared_features' USER_DATA_TTL_HOURS, which drops the same

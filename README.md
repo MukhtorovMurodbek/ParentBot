@@ -1,33 +1,42 @@
 # ParentBot
 
-The private one. It watches the other four bots in the family, tells you when
-something is wrong without being asked, and lets you run any of their
-owner-only commands from one chat.
+The private one. It watches the other four bots in the family, reports
+anything wrong without being asked, and runs any of their owner-only commands
+from a single chat.
 
 Unlike its four siblings this bot has no public side at all. `PBOT_ADMIN_ID`
-is required, not optional — with it empty ParentBot refuses to start rather
-than run open to whoever finds it. Anyone who isn't on that list gets one
-sentence, and you get told they turned up.
+is required rather than optional: with it empty ParentBot refuses to start
+rather than run open to whoever finds it. Anyone not on that list gets one
+sentence, and the operator is told they turned up.
+
+This repository is published for reference. It is not intended to be useful
+on its own — it monitors four specific sibling bots through a shared Postgres
+database, and without them there is nothing for it to watch.
 
 ## What it does on its own
 
 - **Watches uptime.** Every bot stamps a heartbeat into the shared database
-  every 30 seconds. ParentBot checks once a minute and messages you when one
-  goes stale — and again when it comes back. It alerts on the change, so a
-  bot that stays down doesn't repeat itself at you.
-- **Forwards crashes.** Every unhandled exception in any bot already gets
-  counted for that bot's `/status`; now it also arrives here, with the tail
-  of the traceback.
-- **Tells you about donations**, since that's the one interruption worth
+  every 30 seconds. ParentBot checks once a minute and reports when one goes
+  stale, and again when it comes back. It alerts on the *change*, so a bot
+  that stays down does not repeat itself.
+- **Forwards crashes.** Every unhandled exception in any bot is counted for
+  that bot's own `/status` and also arrives here, with the tail of the
+  traceback.
+- **Reports donations**, which is the one unprompted interruption worth
   having.
 - **Says when it has gone blind.** If ParentBot's own database connection
-  fails, it says so over Telegram — otherwise the one failure that stops all
-  the alerts would be the one failure you'd never hear about.
+  fails it says so over Telegram, because otherwise the one failure that
+  stops every alert would be the one failure nobody hears about.
 - **Knows a deploy from a crash.** A redeploy makes a heartbeat stale exactly
-  the way a crash does, so a bot that is shut down on purpose leaves a note
-  in the shared database on its way out, and the watchdog stays quiet at both
-  ends. If it does not come back within `PBOT_REDEPLOY_GRACE_SECONDS` (300),
-  the ordinary "it is down" alert fires after all.
+  the way a crash does, so a bot shut down on purpose leaves a note in the
+  shared database on its way out and the watchdog stays quiet at both ends.
+  If it does not come back within `PBOT_REDEPLOY_GRACE_SECONDS` (300), the
+  ordinary "it is down" alert fires after all — a deploy that never came
+  back is exactly what is worth being told about.
+- **Knows a version gap from a fault.** The bots deploy independently, so
+  ParentBot is routinely a version or two ahead of what it is asking. A
+  command a bot is too old to know about is answered with both version
+  numbers and what to publish, rather than with "Unknown command".
 
 ## /ping, in detail
 
@@ -56,9 +65,11 @@ The first line is the only approximate one — Telegram stamps messages with
 whole seconds — and it is labelled that way rather than quietly presented as
 precise.
 
-`/ping` with nothing named still asks everyone at once and reports one line
-each. `/ping parent` measures ParentBot against the database and back, which
-is the cleanest reading of how far this machine is from Supabase.
+`/ping` with nothing named asks everyone at once and reports one line each,
+with a button per bot underneath for the full breakdown above — rendered
+from the ping that just ran, not from a second one. `/ping parent` measures
+ParentBot against the database and back, which is the cleanest reading of how
+far this machine is from it.
 
 ## Commands
 
@@ -79,10 +90,16 @@ Reaching into a bot:
 - `/ping [bot]` — the round trip, leg by leg; no bot named pings all at once
 - `/errors <bot>` — that bot's errors since it last started
 - `/logs <bot> [n]` — tail its `errors.log` (add `bot` for `bot.log`)
-- `/whois <bot> <user_id>` — look someone up through that bot
-- `/say <bot> <user_id> <text>` — DM someone **as** that bot
+- `/whois <bot> <user_id>` — look an account up through that bot
+- `/say <bot> <user_id> <text>` — message someone **as** that bot
 - `/dbdump <bot>` — that bot's own tables as a zip of CSVs
 - `/restart <bot>` — restart its process
+- `/crashtest <bot>` — make it raise on purpose, to confirm the alert arrives
+- `/providers`, `/probe` — download-route health, and an active probe
+- `/stars` — the Stars ledger
+
+Every owner-only command any bot in the family has is reachable from here.
+The last three name only one bot each, so the bot name is optional.
 
 Across the whole family:
 - `/users [hours]` — active users per bot, default 24h
@@ -91,8 +108,9 @@ Across the whole family:
 - `/backup` — the entire database as one zip of CSVs
 - `/start`, `/help` — the same thing: this list, printed in the chat
 
-Any unambiguous prefix names a bot: `/logs stick`, `/run conv status`,
-`/dbdump anon` all work.
+Any unambiguous prefix names a bot, and so does its Telegram username:
+`/logs stick`, `/run conv status`, `/dbdump anon` and `/logs @mumu_chat_bot`
+all reach the right one.
 
 ## How it reaches the other bots
 
@@ -100,16 +118,16 @@ Not over the network — through the database. `/run` puts a row on
 `family.commands`; the target bot's poller claims it, runs the handler in its
 own process as its own Telegram identity, and writes the answer back. So:
 
-- it works whether ParentBot is on your laptop and the bot is on Railway, or
+- it works whether ParentBot is on a laptop and the bot is in the cloud, or
   the other way round, with neither reachable from the other;
-- a bot that's down never claims the command, and ParentBot tells you that
-  after 90 seconds instead of hanging;
-- `/say` arrives from the bot the user was already talking to, because that
+- a bot that is down never claims the command, and ParentBot says so after 90
+  seconds instead of hanging;
+- `/say` arrives from the bot the person was already talking to, because that
   bot is what actually sends it.
 
-ParentBot reads the other bots' tables directly (that's what one shared
-database is for) but never writes to them. Anything that changes state goes
-through the command queue so the owning bot does it with its own code.
+ParentBot reads the other bots' tables directly — that is what one shared
+database is for — but never writes to them. Anything that changes state goes
+through the command queue, so the owning bot does it with its own code.
 
 See [../ARCHITECTURE.md](../ARCHITECTURE.md) for the full picture and
 `family_link.py` for the bus itself.
@@ -122,19 +140,20 @@ cp .env.example .env      # then fill in PBOT_TOKEN, PBOT_USERNAME, PBOT_ADMIN_I
 python bot.py
 ```
 
-It needs the shared family Postgres. Locally that's `docker compose up -d` in
-the repo root; deployed it's the project's Postgres service. Get your numeric
-Telegram id from [@userinfobot](https://t.me/userinfobot).
+It needs the shared Postgres database the family uses. A numeric Telegram
+account id can be read from [@userinfobot](https://t.me/userinfobot).
 
-`/crashtest` deliberately raises, so you can confirm the whole chain —
-`errors.log`, the error counter, and the alert arriving in your chat — really
-works without waiting for a real bug.
+`/crashtest` raises on purpose, so the whole chain — `errors.log`, the error
+counter, and the alert arriving in the chat — can be confirmed without
+waiting for a real bug. `/crashtest <bot>` does the same inside another bot,
+which is the more useful direction: what is worth knowing when a bot goes
+quiet is whether *that* bot would have reported it.
 
 ## Also here
 
-`family_db.py` is the portable database exporter/importer — it moves rows
+`family_db.py` is a portable database exporter and importer. It moves rows
 over the same psycopg connection the bots use, so it needs no `pg_dump` and
-can't hit a version mismatch:
+cannot hit a client/server version mismatch:
 
 ```bash
 python family_db.py backup  --from cloud

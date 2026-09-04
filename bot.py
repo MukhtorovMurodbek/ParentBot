@@ -33,8 +33,10 @@ import html
 import json
 import logging
 import os
+import re
 import time as time_module
 from collections import OrderedDict
+from itertools import takewhile
 from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
 
@@ -173,19 +175,52 @@ CHILDREN = _parse_registry()
 ALL_BOTS = CHILDREN + [{"id": BOT_NAME, "name": DISPLAY_NAME, "schema": db.DB_SCHEMA}]
 
 
+# The one place a name that is not the family name is allowed to exist.
+#
+# Every layer of this project derives from one canonical id -- see the naming
+# table in ARCHITECTURE.md -- with exactly one exception: the Telegram
+# @username. Two of those were chosen before the family names settled and
+# cannot simply be brought into line, because a username is not a label but
+# an address:
+#
+#   AnonBot is @mumu_chat_bot, and every inbox link anybody has ever posted
+#   is https://t.me/mumu_chat_bot?start=q_<token>. Changing it does not
+#   rename the bot, it breaks every one of those links, permanently, with no
+#   redirect and no way to find the people holding them. That username is
+#   frozen for as long as the bot has users.
+#
+#   ParentBot is @mumu_manager_bot, which is only an inconsistency -- it is
+#   private, it has one user, and nobody has a saved link to it. That one is
+#   safe to change in @BotFather whenever it is convenient, and DEPLOY.md
+#   says so.
+#
+# So rather than pretend the mismatch is not there, it is written down here
+# and every form resolves. `/logs chat`, `/logs anon`, `/logs anonbot` and
+# `/logs @mumu_chat_bot` all reach the same bot.
+USERNAME_ALIASES = {
+    "stickerbot": ["mumu_sticker_bot"],
+    "convertbot": ["mumu_convert_bot"],
+    "downloaderbot": ["mumu_downloader_bot"],
+    "anonbot": ["mumu_chat_bot", "chat", "chatbot"],
+    "parentbot": ["mumu_manager_bot", "manager", "managerbot"],
+}
+
+
+def _names_of(bot: dict) -> list[str]:
+    return [bot["id"], bot["name"].lower(), bot["schema"], *USERNAME_ALIASES.get(bot["id"], [])]
+
+
 def resolve_bot(token: str) -> dict | None:
-    """Accepts "sticker", "stickerbot", "StickerBot", "sticker_bot" -- any
-    unambiguous prefix of the id, the display name, or the schema."""
+    """Accepts "sticker", "stickerbot", "StickerBot", "sticker_bot",
+    "@mumu_sticker_bot" -- any unambiguous prefix of the id, the display
+    name, the schema, or the Telegram username."""
     token = token.strip().lower().lstrip("@")
     if not token:
         return None
     for bot in ALL_BOTS:
-        if token in (bot["id"], bot["name"].lower(), bot["schema"]):
+        if token in _names_of(bot):
             return bot
-    matches = [
-        b for b in ALL_BOTS
-        if b["id"].startswith(token) or b["name"].lower().startswith(token) or b["schema"].startswith(token)
-    ]
+    matches = [b for b in ALL_BOTS if any(n.startswith(token) for n in _names_of(b))]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -399,6 +434,80 @@ async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /run -- reaching into another bot
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Asking an older bot for something it has never heard of
+# ---------------------------------------------------------------------------
+# The bots deploy independently and are meant to: publish.ps1 takes -Skip so
+# a busy bot can be held back, and a bot on an older version answers an
+# unknown family command with "Unknown command" rather than failing. That is
+# the right behaviour and it stays.
+#
+# What it is not is a good explanation. ParentBot is always the first thing
+# to ship (it is private, so it costs nobody anything), which means it is
+# routinely a version or two ahead of the bots it is asking. Typing
+# /providers and being told "Unknown command 'providers'" says the bot is
+# broken; the truth is that DownloaderBot has not been published since the
+# command was written.
+#
+# ParentBot already knows every bot's version -- it is in the heartbeat and
+# on the /status board. So it can say which it is, before the round trip.
+# Anything not listed here has been in the family since before the versions
+# were tracked, and is never blocked.
+COMMAND_SINCE = {
+    "probe": "1.2.1",
+    "providers": "1.2.3",
+    "stars": "1.2.3",
+    "crashtest": "1.2.3",
+}
+
+
+def _version_key(version: str | None):
+    """A sortable form of a family version, or None if it cannot be read.
+
+    Tolerant on purpose. It has to cope with `1.2.2R` (a retouch release
+    sorts after the plain patch), with `test` (what testbot/run.ps1 sets),
+    and with whatever a future release invents -- and the cost of getting it
+    wrong is refusing a command that would have worked. So anything it
+    cannot parse reads as None, and None never blocks.
+    """
+    if not version:
+        return None
+    parts = []
+    for chunk in str(version).strip().split("."):
+        digits = "".join(takewhile(str.isdigit, chunk))
+        if not digits:
+            return None
+        # The suffix orders after the bare number: 1.2.2 < 1.2.2R.
+        parts.append((int(digits), chunk[len(digits):]))
+    return tuple(parts)
+
+
+# A flag can be as new as a command, and is more dangerous: an unknown
+# command is refused, while an unknown flag is just part of the message. A
+# 1.2.x bot handed `broadcast --active hello` would send every user it has
+# ever seen a message beginning "--active".
+FLAG_SINCE = {("broadcast", "--active"): "1.3.0"}
+
+
+def _too_old_for(bot_version: str | None, command: str, args: list[str] | None = None) -> str | None:
+    """The sentence to show instead of queueing, or None to go ahead."""
+    needed = COMMAND_SINCE.get(command)
+    for (cmd, flag), since in FLAG_SINCE.items():
+        if cmd == command and args and flag in args:
+            needed = since
+            command = f"{command} {flag}"
+            break
+    if not needed:
+        return None
+    have, want = _version_key(bot_version), _version_key(needed)
+    if have is None or want is None or have >= want:
+        return None
+    return (f"That bot is on <b>{html.escape(str(bot_version))}</b> and "
+            f"<code>{html.escape(command)}</code> arrived in <b>{needed}</b>, so it has "
+            f"never heard of it — nothing is broken, it just has not been published "
+            f"since.\n\nShip it with <code>.\\publish.ps1 -Only {{dir}}</code>, then try again.")
+
+
 async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     bot: dict, command: str, args: list[str]) -> None:
     if bot["id"] == BOT_NAME:
@@ -409,6 +518,18 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if command not in family_link.COMMANDS:
         known = ", ".join(sorted(family_link.COMMANDS))
         await update.message.reply_text(f"{bot['name']} has no '{command}'. Try: {known}")
+        return
+
+    # Asked before the round trip rather than after it, so a version gap
+    # costs one lookup instead of ninety seconds and a confusing answer.
+    beat = await asyncio.to_thread(db.heartbeat_of, bot["id"])
+    stale = _too_old_for((beat or {}).get("version"), command, args)
+    if stale:
+        await update.message.reply_text(
+            f"⏳ <b>{html.escape(bot['name'])}</b> · {html.escape(command)}\n\n"
+            + stale.replace("{dir}", bot["schema"]),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     command_id = await asyncio.to_thread(
@@ -447,20 +568,35 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _dispatch(update, context, bot, context.args[1].lower(), context.args[2:])
 
 
-def _shortcut(command: str, min_args: int, usage: str):
+def _shortcut(command: str, min_args: int, usage: str, default_bot: str | None = None):
     """Builds /whois, /say, /logs and friends -- each is /run with the
-    command fixed and the first argument still naming the target bot."""
+    command fixed and the first argument still naming the target bot.
+
+    `default_bot` is for the commands only one bot has. /providers and
+    /stars are not ambiguous, so making the owner type which bot owns them
+    is asking them to remember something this file already knows. Naming the
+    bot still works, and still wins, for when that stops being true.
+    """
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update, context):
             return
-        if len(context.args) < min_args:
+        args = list(context.args)
+        bot = resolve_bot(args[0]) if args else None
+        if bot is not None:
+            args = args[1:]
+        elif default_bot:
+            bot = resolve_bot(default_bot)
+        if bot is None:
+            if len(args) < min_args or not args:
+                await update.message.reply_text(usage or f"Which bot? Known: {bot_list_hint()}")
+            else:
+                await update.message.reply_text(
+                    f"No such bot: {args[0]}. Known: {bot_list_hint()}")
+            return
+        if len(args) < max(0, min_args - 1):
             await update.message.reply_text(usage)
             return
-        bot = resolve_bot(context.args[0])
-        if not bot:
-            await update.message.reply_text(f"No such bot: {context.args[0]}. Known: {bot_list_hint()}")
-            return
-        await _dispatch(update, context, bot, command, list(context.args[1:]))
+        await _dispatch(update, context, bot, command, args)
     return handler
 
 
@@ -616,14 +752,102 @@ async def broadcast_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _ping_one(update, context, bot)
         return
 
+    # Everything _render_ping needs is measured here too, per bot, even
+    # though the summary shows one number each. That is what lets the
+    # buttons under the result open a full leg-by-leg breakdown instantly,
+    # from the ping that was actually run, rather than quietly running a
+    # second one and showing different numbers than the row above it.
+    started = time_module.perf_counter()
+    now = datetime.now(timezone.utc)
     live = await LiveMessage.reply_to(update.message, f"🏓 Pinging all {len(CHILDREN)}…")
-    group = {"live": live, "rows": {}, "expected": len(CHILDREN)}
+    ack_ms = (time_module.perf_counter() - started) * 1000
+    try:
+        here = await asyncio.to_thread(family_link.ping_probe)
+    except Exception as exc:
+        here = {"error": f"{type(exc).__name__}: {exc}"}
+
+    group = {"live": live, "rows": {}, "expected": len(CHILDREN), "details": {}}
     for child in CHILDREN:
+        queue_started = time_module.perf_counter()
         command_id = await asyncio.to_thread(
             db.queue_command, child["id"], "ping", "trace",
             update.effective_user.id, update.effective_chat.id,
         )
-        _remember_trace(command_id, {"bot": child, "group": group})
+        _remember_trace(command_id, {
+            "bot": child, "group": group, "here": here,
+            "to_parent": now - update.message.date, "ack_ms": ack_ms,
+            "queue_ms": (time_module.perf_counter() - queue_started) * 1000,
+        })
+
+
+# ---------------------------------------------------------------------------
+# The buttons under a family ping
+# ---------------------------------------------------------------------------
+# /ping with no bot named used to end at four numbers, and getting the
+# breakdown for the one that looked wrong meant typing /ping <bot> and
+# waiting for a second round trip. Four commands to see four bots.
+#
+# The results of the ping that just ran are already in memory, so the
+# breakdown costs nothing to show: one button per bot, plus one that prints
+# all four. Kept per live message rather than globally, so two pings in the
+# same chat do not overwrite each other's buttons.
+
+_PING_GROUPS: "OrderedDict[tuple[int, int], dict]" = OrderedDict()
+MAX_PING_GROUPS = 16
+
+
+def _remember_group(group: dict) -> None:
+    live = group["live"]
+    _PING_GROUPS[(live.chat_id, live.message_id)] = group
+    while len(_PING_GROUPS) > MAX_PING_GROUPS:
+        _PING_GROUPS.popitem(last=False)
+
+
+def _ping_keyboard(group: dict) -> InlineKeyboardMarkup:
+    live = group["live"]
+    key = f"{live.chat_id}:{live.message_id}"
+    buttons = [
+        InlineKeyboardButton(child["name"], callback_data=f"pingdet:{key}:{child['id']}")
+        for child in CHILDREN if child["id"] in group["details"]
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("📋 All details", callback_data=f"pingdet:{key}:*")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ping_detail_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A tap on one of those buttons. Renders from what the ping already
+    collected, so the detail agrees with the summary above it by
+    construction -- a second round trip would give different numbers and
+    invite the question of which of the two is real."""
+    if not await guard(update, context):
+        return
+    query = update.callback_query
+    _, chat_id, message_id, which = query.data.split(":", 3)
+    group = _PING_GROUPS.get((int(chat_id), int(message_id)))
+    if group is None:
+        # Only after a redeploy, or sixteen pings ago. Say so rather than
+        # showing an empty report.
+        await query.answer("That ping is no longer in memory — run /ping again.",
+                           show_alert=True)
+        return
+
+    wanted = [c for c in CHILDREN
+              if (which == "*" or which == c["id"]) and c["id"] in group["details"]]
+    if not wanted:
+        await query.answer("Nothing was recorded for that one.", show_alert=True)
+        return
+    await query.answer()
+
+    body = "\n\n".join(_render_ping(*group["details"][c["id"]]) for c in wanted)
+    if len(body) <= TELEGRAM_MAX_CHARS:
+        await context.bot.send_message(chat_id=query.message.chat_id, text=body,
+                                       parse_mode=ParseMode.HTML)
+        return
+    # Four full reports can outgrow one message. The file is plain text, so
+    # the markup is stripped rather than shown as tags.
+    await send_long(context, query.message.chat_id,
+                    re.sub(r"<[^>]+>", "", body), filename="ping.txt")
 
 
 async def _deliver_ping(context: ContextTypes.DEFAULT_TYPE, trace: dict, result: dict) -> None:
@@ -640,15 +864,22 @@ async def _deliver_ping(context: ContextTypes.DEFAULT_TYPE, trace: dict, result:
         group["rows"][name] = "no answer — down"
     else:
         group["rows"][name] = _ms(result["taken_at"] - result["created_at"]).strip()
+    # Kept whole, so the buttons below can print the breakdown without
+    # asking the bot anything a second time.
+    group["details"][trace["bot"]["id"]] = (trace, result)
     lines = [f"{n:<14}{v}" for n, v in sorted(group["rows"].items())]
     missing = group["expected"] - len(group["rows"])
     text = f"🏓 <b>Family ping</b>\n<pre>{html.escape(chr(10).join(lines))}</pre>"
+    keyboard = None
     if missing > 0:
         text += f"\nWaiting on {missing} more (down after {COMMAND_TIMEOUT_SECONDS}s)."
     else:
         text += ("\nAdmin round trip through Postgres — not what a user waits for; "
-                 "their message never takes this path. /ping &lt;bot&gt; breaks one down.")
-    await group["live"].set(context.bot, text, parse_mode=ParseMode.HTML)
+                 "their message never takes this path. Tap a bot for its breakdown.")
+        _remember_group(group)
+        keyboard = _ping_keyboard(group)
+    await group["live"].set(context.bot, text, parse_mode=ParseMode.HTML,
+                            reply_markup=keyboard)
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1323,18 @@ async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         mark = "✅" if result["ok"] else "⚠️"
         body = result["output"] or "(no output)"
+        # The pre-flight check in _dispatch catches the version gap for every
+        # command in COMMAND_SINCE. This catches the rest: a command added to
+        # the bus without being listed there, or a bot whose version string
+        # could not be read. "Unknown command" on its own reads as a fault;
+        # with the two version numbers beside it, it reads as a deploy.
+        if not result["ok"] and body.startswith("Unknown command"):
+            beat = await asyncio.to_thread(db.heartbeat_of, result["target_bot"])
+            theirs = (beat or {}).get("version")
+            if theirs and theirs != family_link.VERSION:
+                body += (f"\n\nThat bot is on {theirs}; ParentBot is on "
+                         f"{family_link.VERSION}. Most likely it has not been "
+                         f"published since the command was written.")
         if result["file_bytes"]:
             await context.bot.send_document(
                 chat_id=chat_id,
@@ -1134,6 +1377,14 @@ HELP = """👪 <b>ParentBot</b> — the family's manager.
 /say &lt;bot&gt; &lt;user_id&gt; &lt;text&gt; — DM someone <i>as</i> that bot
 /dbdump &lt;bot&gt; — that bot's own tables as CSVs
 /restart &lt;bot&gt; — restart its process
+/crashtest &lt;bot&gt; — make it raise on purpose, to check the alert arrives
+    (no bot named crashes ParentBot itself)
+/providers [downloader] — which download route is working, which is resting
+/probe &lt;downloader&gt; [platform] — actively try every route, now
+/stars [convert] — the Stars ledger: paid, free and refunded
+
+Every owner-only command any bot has is reachable from here. If one is
+missing, that is a bug — see family_link.COMMANDS.
 
 <b>Shipping an update</b>
 /pause [bot|all] [minutes] — stop them taking work an update would lose;
@@ -1172,9 +1423,24 @@ async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def crashtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Same escape hatch every other bot has: proves the crash path, the
-    errors.log, and the family alert all really fire."""
+    """Proves the crash path, the errors.log and the family alert all really
+    fire -- for ParentBot itself, or for any child bot by name.
+
+    Naming a bot is the more useful direction and the one that was missing.
+    ParentBot crashing tells you ParentBot's own reporting works, which you
+    can see happening in front of you. What you actually want to know, when
+    a bot has gone quiet, is whether *that* bot would have told you -- and
+    that is the one test you could not run from here.
+    """
     if not await guard(update, context):
+        return
+    if context.args:
+        bot = resolve_bot(context.args[0])
+        if not bot:
+            await update.message.reply_text(
+                f"No such bot: {context.args[0]}. Known: {bot_list_hint()}")
+            return
+        await _dispatch(update, context, bot, "crashtest", [])
         return
     raise RuntimeError("Manual /crashtest trigger -- ParentBot's error tracking works.")
 
@@ -1424,7 +1690,11 @@ def main():
     app = builder.build()
     lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
-    app.add_handler(TypeHandler(Update, track_activity), group=-1)
+    # Its own group -- see the note in the child bots' main(): a TypeHandler
+    # on Update matches everything, so anything sharing a group with it never
+    # runs. ParentBot has nothing else up here today; the numbering is what
+    # keeps that true when it does.
+    app.add_handler(TypeHandler(Update, track_activity), group=-3)
 
     app.add_handler(CommandHandler(["start", "help"], start_command))
     app.add_handler(CommandHandler("status", status_command))
@@ -1445,6 +1715,13 @@ def main():
     app.add_handler(CommandHandler("restart", _shortcut("restart", 1, "Usage: /restart <bot>")))
     app.add_handler(CommandHandler("whois", _shortcut("whois", 2, "Usage: /whois <bot> <user_id>")))
     app.add_handler(CommandHandler("say", _shortcut("message", 3, "Usage: /say <bot> <user_id> <text>")))
+    # The bot-specific ones. Each defaults to the only bot that has it, so
+    # the command centre does not make you remember which bot owns what --
+    # /providers and /stars are unambiguous, and typing the bot name is
+    # still allowed for when that stops being true.
+    app.add_handler(CommandHandler("providers", _shortcut("providers", 0, "", default_bot="downloaderbot")))
+    app.add_handler(CommandHandler("probe", _shortcut("probe", 0, "", default_bot="downloaderbot")))
+    app.add_handler(CommandHandler("stars", _shortcut("stars", 0, "", default_bot="convertbot")))
 
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("pause", pause_command))
@@ -1452,6 +1729,7 @@ def main():
     app.add_handler(CommandHandler("finishupdates", finish_updates_command))
 
     app.add_handler(CallbackQueryHandler(board_button, pattern=r"^board:"))
+    app.add_handler(CallbackQueryHandler(ping_detail_button, pattern=r"^pingdet:"))
     app.add_handler(CallbackQueryHandler(broadcast_button, pattern=r"^upd:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))

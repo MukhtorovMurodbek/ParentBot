@@ -9,7 +9,7 @@
     "restartPolicyMaxRetries": 10,
     "numReplicas": 1,
     "sleepApplication": false,
-    "overlapSeconds": 0,
+    "overlapSeconds": 30,
     "drainingSeconds": 120
   }
 }

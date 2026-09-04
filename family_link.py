@@ -75,7 +75,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.2.2")
+VERSION = os.environ.get("FAMILY_VERSION", "1.3.0")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -547,6 +547,38 @@ async def _cmd_restart(context, args):
     return "Restarting now (a supervisor brings it back; a hand-started process just stops).", None, None
 
 
+async def _cmd_crashtest(context, args):
+    """Deliberately raise inside this bot, so the whole crash path can be
+    checked end to end from ParentBot without waiting for a real bug.
+
+    StickerBot has had a local `/crashtest` for this since v0.4, and it was
+    the one owner-only command with no way to reach it from ParentBot. Now
+    every bot has it, which is the more useful shape: what you actually want
+    to know is whether the reporting works for the bot that just went quiet,
+    and that is never the bot whose chat you happen to be in.
+
+    The raise goes through `application.create_task` rather than being raised
+    here. A bus handler that raises is caught by `_run_one_command`, which
+    turns it into a failed command result -- informative, but it never
+    reaches the error handler, so it would test nothing. `create_task` routes
+    the exception to exactly where a real handler's would go:
+    shared_features.error_handler -> record_error -> emit_event -> the alert
+    ParentBot forwards. If that alert does not arrive within a few seconds,
+    the crash reporting is broken and this is how you found out.
+    """
+    app = getattr(context, "application", None)
+    if app is None:
+        raise RuntimeError("Manual crashtest via ParentBot -- error tracking works.")
+
+    async def _boom():
+        raise RuntimeError(
+            f"Manual crashtest for {_bot_id} via ParentBot -- error tracking works.")
+
+    app.create_task(_boom())
+    return ("Raised. The alert should arrive in a moment; if it does not, "
+            "the crash reporting is what is broken."), None, None
+
+
 # ---------------------------------------------------------------------------
 # Talking to everybody, and announcing an update before it lands
 # ---------------------------------------------------------------------------
@@ -603,6 +635,24 @@ def _language_of(user_id: int) -> str | None:
         return None
 
 
+# Who counts as "active" when a broadcast is aimed rather than sent to
+# everybody. Seven days, and the number is a judgement about what an
+# announcement is for rather than about the data.
+#
+# An advance notice of an update is only worth sending to somebody it might
+# actually affect. Sending it to every account that ever typed /start is a
+# push notification to people who used the bot once in March, which reads as
+# spam and is the fastest way to teach them to mute it -- so the next notice,
+# the one that matters, is not seen either. Seven days covers everyone with a
+# habit, including the weekly user, and excludes the long tail.
+#
+# It is deliberately not the same window as /users' default (24 hours). That
+# one answers "is anyone around right now", which is an operational question
+# asked at the moment of deploying. This one answers "who would want to
+# know", which is asked the day before.
+BROADCAST_ACTIVE_DAYS = int(os.environ.get("FAMILY_BROADCAST_ACTIVE_DAYS", "7"))
+
+
 def _everyone() -> list[int]:
     fn = getattr(db, "list_all_users", None)
     if fn is None:
@@ -612,6 +662,24 @@ def _everyone() -> list[int]:
     except Exception:
         logger.exception("Could not read this bot's user list")
         return []
+
+
+def _recently_active(days: int) -> list[int] | None:
+    """Everyone seen in the last `days`, or None if this bot cannot say.
+
+    None rather than an empty list, because the two mean opposite things: a
+    bot with no activity table cannot answer the question, and answering it
+    with "nobody" would silently turn an aimed broadcast into no broadcast at
+    all.
+    """
+    fn = getattr(db, "active_user_ids_since", None)
+    if fn is None:
+        return None
+    try:
+        return fn(datetime.now(timezone.utc) - timedelta(days=days))
+    except Exception:
+        logger.exception("Could not read this bot's active users")
+        return None
 
 
 # Telegram's documented ceiling for bulk sends is about 30 messages a second,
@@ -654,17 +722,30 @@ async def _cmd_broadcast(context, args):
     and this file has no way to write them again in Uzbek. The four sentences
     the *bots* say about updates are the translated ones.
     """
+    aimed = bool(args) and args[0] == "--active"
+    if aimed:
+        args = args[1:]
     text = " ".join(args).strip()
     if not text:
-        return "Usage: broadcast <text>", None, None
-    users = await asyncio.to_thread(_everyone)
+        return "Usage: broadcast [--active] <text>", None, None
+
+    if aimed:
+        users = await asyncio.to_thread(_recently_active, BROADCAST_ACTIVE_DAYS)
+        if users is None:
+            return ("This bot cannot tell who is active, so --active would have "
+                    "reached nobody. Nothing was sent."), None, None
+        who = f"active in the last {BROADCAST_ACTIVE_DAYS} day(s)"
+    else:
+        users = await asyncio.to_thread(_everyone)
+        who = "everyone this bot knows"
+
     if not users:
-        return "Nobody to broadcast to (this bot has no user list).", None, None
+        return f"Nobody to broadcast to ({who}).", None, None
     delivered, skipped = await _send_to_each(
         context, ((uid, uid) for uid in users), lambda _uid: text,
     )
     return (
-        f"Broadcast to {delivered} of {len(users)} user(s)"
+        f"Broadcast to {delivered} of {len(users)} user(s), {who}"
         + (f"; {skipped} unreachable." if skipped else "."),
         None, None,
     )
@@ -741,6 +822,7 @@ COMMANDS = {
     "message": _cmd_message,
     "logs": _cmd_logs,
     "restart": _cmd_restart,
+    "crashtest": _cmd_crashtest,
     "broadcast": _cmd_broadcast,
     "pause": _cmd_pause,
     "warnbusy": _cmd_warnbusy,
@@ -757,7 +839,8 @@ COMMAND_HELP = {
     "message": "message <user_id> <text> -- DM someone as that bot",
     "logs": "logs [n] [bot] -- tail errors.log, or bot.log with 'bot'",
     "restart": "restart that bot's process",
-    "broadcast": "broadcast <text> -- one message to everyone, as that bot",
+    "crashtest": "raise on purpose, to check the crash alert still works",
+    "broadcast": "broadcast [--active] <text> -- one message as that bot; --active aims it at recent users only",
     "pause": "pause [minutes] -- decline new long work and say why",
     "warnbusy": "tell whoever is mid-something that it is about to be reset",
     "resume": "reopen, and tell everyone who was turned away",
@@ -954,6 +1037,14 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
 
     Never raises: a bot whose shared database is unreachable logs a warning
     and carries on serving its users with no family bus at all.
+
+    FAMILY_BOT_ID and FAMILY_LABEL override what this process calls itself on
+    the bus. They exist for the test bot (see `testbot/`), which runs one of
+    the four bots' code on a spare token: without them it would write its
+    heartbeat under the real bot's id, and ParentBot would show a laptop
+    process as the live one. `testbot/run.ps1` points at a local database as
+    well, so this is the second of two locks on the same door rather than the
+    only one.
     """
     global _bot_id, _display_name, _start_time, _enabled
 
@@ -961,6 +1052,8 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
         logger.info("Family bus disabled (FAMILY_BUS=off) -- running standalone.")
         return
 
+    bot_id = os.environ.get("FAMILY_BOT_ID") or bot_id
+    display_name = os.environ.get("FAMILY_LABEL") or display_name
     _bot_id, _display_name, _start_time = bot_id, display_name, start_time
 
     try:

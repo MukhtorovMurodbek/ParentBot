@@ -307,6 +307,17 @@ def count_active_users_since(since) -> int:
 
 # ---------- family.heartbeats ----------
 
+
+def active_user_ids_since(since) -> list[int]:
+    """Everyone with activity since `since`. Used by the family bus for an
+    aimed broadcast -- see BROADCAST_ACTIVE_DAYS in family_link.py."""
+    with pooled_read() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT user_id FROM activity_events WHERE occurred_at >= %s",
+            (since,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
 def all_heartbeats() -> list[dict]:
     with pooled_read() as conn:
         cur = conn.execute(
@@ -319,6 +330,29 @@ def all_heartbeats() -> list[dict]:
         )
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def heartbeat_of(bot_id: str) -> dict | None:
+    """One bot's row, or None if it has never been seen.
+
+    Separate from all_heartbeats() because it is asked on the way into every
+    /run: the version check in bot.py wants one bot, not five, and this runs
+    in front of a command the owner is waiting on.
+    """
+    with pooled_read() as conn:
+        cur = conn.execute(
+            f"""
+            SELECT bot_id, display_name, host, version, pid, db_schema,
+                   started_at, last_seen, error_count,
+                   EXTRACT(EPOCH FROM (now() - last_seen))::int AS seconds_ago
+            FROM {FAMILY_SCHEMA}.heartbeats WHERE bot_id = %s
+            """,
+            (bot_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip([d.name for d in cur.description], row))
 
 
 # ---------- family.bot_state (edge-triggered up/down alerting) ----------
