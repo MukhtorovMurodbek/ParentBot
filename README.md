@@ -1,3 +1,5 @@
+<img src="logo.svg" alt="ParentBot" width="72" align="right">
+
 # ParentBot
 
 The private one. It watches the other four bots in the family, reports

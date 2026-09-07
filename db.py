@@ -524,14 +524,6 @@ def set_setting(key: str, value: str) -> None:
 # ---------- cross-schema reads (the whole point of one shared database) ----------
 
 
-def _table_exists(conn, schema: str, table: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
-        (schema, table),
-    )
-    return cur.fetchone() is not None
-
-
 def _existing_tables(conn, schemas: list[str], table: str) -> set[str]:
     """Which of these schemas actually have this table yet -- one lookup for
     the whole family rather than one per bot."""

@@ -305,6 +305,39 @@ def _read_state(kind: str) -> list[tuple[str, dict]]:
     return rows
 
 
+def forget_user(user_id: int) -> int:
+    """Delete everything this table holds for one person. Blocking; call
+    through asyncio.to_thread.
+
+    Reached from /deletemydata, which is the one place a user can ask for
+    their data back. The bot's own tables are its db.py's business -- this
+    is the half that db.py cannot clean up, because the table name and the
+    shape of a conversation key are both known only here.
+
+    Conversation rows are matched on the key's *last* component. A
+    ConversationHandler key is (chat, user) by default and (user,) with
+    per_chat=False, and the user id is the trailing part either way.
+
+    Returns 0 when the table is not there at all, which is the normal state
+    of a bot running with DEPLOY_SAFETY=off: nothing was persisted, so there
+    is nothing to forget. Letting the DELETE raise instead meant
+    /deletemydata reported "couldn't erase that" to somebody whose data had
+    just been erased -- the bot's own tables are cleared before this is
+    called -- which is the worst answer available for an action with no undo.
+    """
+    with db.pooled() as conn:
+        if conn.execute("SELECT to_regclass(%s)", (STATE_TABLE,)).fetchone()[0] is None:
+            return 0
+        cur = conn.execute(
+            f"DELETE FROM {STATE_TABLE} WHERE (kind = 'user' AND key = %s) "
+            f"OR (kind = 'conversation' AND (key LIKE %s OR key LIKE %s))",
+            (str(user_id), f"%:{user_id}", f"%|{user_id}"),
+        )
+        removed = cur.rowcount or 0
+        conn.commit()
+    return removed
+
+
 try:
     from telegram.ext import BasePersistence, PersistenceInput
 except ImportError:  # pragma: no cover -- only if PTB is missing entirely
@@ -764,19 +797,6 @@ def take_held(bot_id: str) -> "list[tuple[int, int]]":
         rows = cur.fetchall()
         conn.commit()
     return [(int(u), int(c)) for u, c in rows]
-
-
-def held_count(bot_id: str) -> int:
-    schema = _family_schema()
-    try:
-        with db.pooled() as conn:
-            cur = conn.execute(
-                f"SELECT COUNT(*) FROM {schema}.{WAITLIST_TABLE} WHERE bot_id = %s",
-                (bot_id,),
-            )
-            return int(cur.fetchone()[0])
-    except Exception:
-        return 0
 
 
 def in_flight() -> "list[tuple[int, str]]":

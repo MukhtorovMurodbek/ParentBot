@@ -106,17 +106,6 @@ def bump(chat_id: int, message_id: int) -> None:
     note_incoming(chat_id, message_id)
 
 
-def is_last(chat_id: int, message_id: int) -> bool:
-    """True if nothing has arrived in this chat since `message_id`.
-
-    Rests on one property of the Bot API: message_id counts up within a chat
-    across *everyone* in it, the bot included. So "is this message still the
-    newest" is a comparison, not a query -- there is no API call that answers
-    it, and this is why there does not need to be one.
-    """
-    return message_id >= _last_incoming.get(chat_id, 0)
-
-
 def _edit_kwargs(kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k not in _SEND_ONLY_KWARGS}
 

@@ -75,7 +75,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.3.1H")
+VERSION = os.environ.get("FAMILY_VERSION", "1.4.0")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -269,16 +269,6 @@ def mark_bus_active() -> None:
 
 def bus_is_active() -> bool:
     return time.monotonic() < _bus_active_until
-
-
-def db_round_trip_ms() -> float:
-    """How long one trivial query to the shared database takes, from this
-    process. The honest measure of "how far away is Postgres from here",
-    which is most of what a slow bot turns out to be."""
-    started = time.perf_counter()
-    with _connect() as conn:
-        conn.execute("SELECT 1").fetchone()
-    return (time.perf_counter() - started) * 1000
 
 
 # ---------------------------------------------------------------------------
