@@ -46,7 +46,10 @@ try:  # optional convenience: load the .env sitting next to this file
 except ImportError:
     pass
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, BotCommandScopeChat, InlineKeyboardButton,
+    InlineKeyboardMarkup, Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -376,6 +379,160 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await update.message.reply_text(board, parse_mode=ParseMode.HTML, reply_markup=_board_keyboard())
+
+
+# ---------------------------------------------------------------------------
+# /usage -- what the containers have been costing, rather than whether they
+# are up
+# ---------------------------------------------------------------------------
+# /status answers "is it alive". This answers "what is alive costing, and is
+# that normal", which is a different question and the one the bill asks.
+#
+# The rate below is Railway's published memory price. It is here, as a
+# constant with its own name, so the number in the message is arithmetic
+# anybody can check rather than a figure somebody remembered -- and so that
+# when Railway changes it, one line changes.
+MEMORY_USD_PER_MB_MONTH = float(os.environ.get("MEMORY_USD_PER_MB_MONTH") or 0.01)
+USAGE_REPORT_HOURS = int(os.environ.get("USAGE_REPORT_HOURS") or 24)
+
+
+def _usage_report(hours: int) -> str:
+    samples = family_link.usage_history(None, hours)
+    if not samples:
+        return (f"No usage samples in the last {hours}h.\n\n"
+                "Each bot writes one every USAGE_SAMPLE_MINUTES (15 by default), so this "
+                "is empty until they have been up that long on a version that has it.")
+
+    per_bot: dict[str, list[dict]] = {}
+    for sample in samples:
+        per_bot.setdefault(sample["bot_id"], []).append(sample)
+
+    lines = [f"<b>Usage, last {hours}h</b>"]
+    total_cost = 0.0
+    for bot_id in sorted(per_bot):
+        rows = per_bot[bot_id]
+        resident = [row["rss_mb"] for row in rows if row["rss_mb"]]
+        peaks = [row["peak_rss_mb"] for row in rows if row["peak_rss_mb"]]
+        ceilings = [row["ceiling_mb"] for row in rows if row["ceiling_mb"]]
+        updates = sum(row["updates"] or 0 for row in rows)
+        people = max((row["users"] or 0) for row in rows)
+        average = sum(resident) / len(resident) if resident else 0
+        cost = average * MEMORY_USD_PER_MB_MONTH
+        total_cost += cost
+        line = f"\n<b>{html.escape(bot_id)}</b>"
+        if resident:
+            line += f"\n  {average:.0f} MB average, {max(peaks or resident)} MB peak"
+            if ceilings:
+                headroom = max(peaks or resident) / max(ceilings)
+                line += f" of {max(ceilings)} MB ({headroom:.0%})"
+            line += f"\n  \u2248 ${cost:.2f}/month in memory"
+        else:
+            line += "\n  no memory readings (not a Linux container?)"
+        line += f"\n  {updates} update(s), busiest window {people} person(s)"
+        lines.append(line)
+
+    lines.append(f"\n<b>All five \u2248 ${total_cost:.2f}/month in memory</b> "
+                 f"at ${MEMORY_USD_PER_MB_MONTH:.3f} per MB-month.")
+    lines.append("\nMemory is the bill: a container is paid for every minute it holds "
+                 "what it holds, busy or not.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /idle -- would sleeping this bot be worth it, and what would it cost
+# ---------------------------------------------------------------------------
+# Railway stops charging for a container once it has sent no outbound traffic
+# for about five minutes, and starts again when something wakes it. Whether
+# that is a good trade for a given bot is two numbers: how much of its life it
+# spends quiet, and how many times a day somebody would therefore wait for a
+# cold start.
+#
+# Both are measured rather than guessed. Every bot accumulates, per window,
+# the seconds it *would* have been asleep (each gap between updates, minus the
+# five minutes before sleeping begins) and the longest gap it saw. This reads
+# those back.
+#
+# Nothing sleeps yet. This is the evidence for deciding what should.
+COLD_START_SECONDS = int(os.environ.get("COLD_START_SECONDS") or 6)
+
+
+def _idle_report(hours: int) -> str:
+    samples = family_link.usage_history(None, hours)
+    if not samples:
+        return (f"No usage samples in the last {hours}h -- nothing to judge yet.\n\n"
+                "Each bot writes one every 15 minutes, so a day of running gives about "
+                "96 per bot, which is enough to see a daily shape.")
+
+    per_bot: dict[str, list[dict]] = {}
+    for sample in samples:
+        per_bot.setdefault(sample["bot_id"], []).append(sample)
+
+    lines = [f"<b>Idle time, last {hours}h</b>",
+             f"<i>Sleeping starts after {family_link.SLEEP_AFTER_SECONDS // 60} min of quiet. "
+             f"Nothing sleeps yet.</i>"]
+    for bot_id in sorted(per_bot):
+        rows = per_bot[bot_id]
+        covered = sum((row["window_minutes"] or 0) for row in rows) * 60
+        if not covered:
+            continue
+        sleepable = sum((row["sleepable_seconds"] or 0) for row in rows)
+        longest = max((row["max_gap_seconds"] or 0) for row in rows)
+        updates = sum((row["updates"] or 0) for row in rows)
+        resident = [row["rss_mb"] for row in rows if row["rss_mb"]]
+        average = sum(resident) / len(resident) if resident else 0
+        share = sleepable / covered
+        # One wake per gap long enough to have slept through. The count is not
+        # stored, so it is bounded from what is: a bot cannot have woken more
+        # times than it handled updates.
+        wakes = min(updates, int(sleepable / max(family_link.SLEEP_AFTER_SECONDS, 1)) + 1)
+        saving = average * MEMORY_USD_PER_MB_MONTH * share
+        verdict = ("worth sleeping" if share >= 0.6 and average
+                   else "not worth it yet" if share >= 0.2
+                   else "busy enough to leave alone")
+        lines.append(
+            f"\n<b>{html.escape(bot_id)}</b> — {share:.0%} of the time asleep"
+            f"\n  longest quiet stretch {longest // 3600}h {(longest % 3600) // 60}m"
+            f"\n  {updates} update(s), about {wakes} wake(s) — "
+            f"{wakes * COLD_START_SECONDS}s of cold start in total"
+            f"\n  would save \u2248 ${saving:.2f}/month · <i>{verdict}</i>"
+        )
+    lines.append("\nA wake costs the person who caused it a few seconds before their "
+                 "first reply. That is the whole trade.")
+    return "\n".join(lines)
+
+
+async def idle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    hours = USAGE_REPORT_HOURS
+    if context.args:
+        try:
+            hours = max(1, min(24 * 45, int(context.args[0])))
+        except ValueError:
+            pass
+    try:
+        report = await asyncio.to_thread(_idle_report, hours)
+    except Exception as exc:
+        await update.message.reply_text(f"\u26a0\ufe0f Couldn't read the usage table: {exc}")
+        return
+    await update.message.reply_text(report, parse_mode=ParseMode.HTML)
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    hours = USAGE_REPORT_HOURS
+    if context.args:
+        try:
+            hours = max(1, min(24 * 45, int(context.args[0])))
+        except ValueError:
+            pass
+    try:
+        report = await asyncio.to_thread(_usage_report, hours)
+    except Exception as exc:
+        await update.message.reply_text(f"\u26a0\ufe0f Couldn't read the usage table: {exc}")
+        return
+    await update.message.reply_text(report, parse_mode=ParseMode.HTML)
 
 
 async def board_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1629,35 +1786,116 @@ async def broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# The menu the owner sees, in the order HELP lists them: watching, reaching
+# into a bot, shipping an update, then the family-wide reads. Every command
+# ParentBot handles is here -- it is a private bot with one user, so a command
+# left out of the menu is a command that has to be remembered instead, which
+# is how /probe and /stars went a version without being typed once.
 BOT_COMMANDS = [
     BotCommand("status", "every bot: up/down, uptime, errors"),
     BotCommand("me", "ParentBot's own status"),
-    BotCommand("ping", "ping one bot, or all of them"),
+    BotCommand("events", "recent crashes / startups / payments"),
+    BotCommand("alerts", "mute or unmute alerts"),
     BotCommand("run", "run a command inside another bot"),
+    BotCommand("ping", "ping one bot, or all of them"),
     BotCommand("errors", "a bot's errors since it started"),
     BotCommand("logs", "tail a bot's log"),
     BotCommand("whois", "look a user up through a bot"),
     BotCommand("say", "DM someone as one of the bots"),
-    BotCommand("broadcast", "message everyone, as one of the bots"),
+    BotCommand("dbdump", "one bot's tables as CSVs"),
+    BotCommand("restart", "restart a bot's process"),
+    BotCommand("crashtest", "make a bot raise, to check the alert arrives"),
+    BotCommand("providers", "DownloaderBot: which route works, which rests"),
+    BotCommand("probe", "DownloaderBot: try every route, now"),
+    BotCommand("stars", "ConvertBot: paid, free and refunded Stars"),
     BotCommand("pause", "stop the bots taking work an update would lose"),
     BotCommand("warn", "tell whoever is mid-something that it will reset"),
     BotCommand("finishupdates", "reopen, and tell everyone who was waiting"),
-    BotCommand("dbdump", "one bot's tables as CSVs"),
-    BotCommand("restart", "restart a bot's process"),
+    BotCommand("broadcast", "message everyone, as one of the bots"),
     BotCommand("users", "active users per bot"),
+    BotCommand("usage", "memory, peaks and what they cost per bot"),
+    BotCommand("idle", "how quiet each bot is, and whether sleeping would pay"),
     BotCommand("donations", "paid donations per bot"),
-    BotCommand("events", "recent crashes / startups / payments"),
     BotCommand("sql", "read-only query on the shared database"),
     BotCommand("backup", "whole database as one zip"),
-    BotCommand("alerts", "mute or unmute alerts"),
     BotCommand("help", "what all of this does"),
 ]
+
+# And what anybody else gets, which is the truth: one command, and it says no.
+# The list above was going up at the default scope, so a stranger who found
+# the private bot was handed a menu reading /sql, /backup, /restart. Every one
+# of them refuses them -- guard() is the thing that decides, not the menu --
+# but a list of the levers is an invitation to lean on them, and there is no
+# reason to publish it.
+STRANGER_COMMANDS = [
+    BotCommand("start", "what this bot is"),
+]
+
+
+async def _publish_commands(application):
+    """The full menu in each owner's chat, and one line for everybody else.
+
+    Never raises. set_my_commands for a chat Telegram has never seen fails,
+    and an owner who has not opened their own bot yet is exactly that chat --
+    a cosmetic call is not a reason to fail a deploy. Same shape as
+    shared_features.publish_commands() in the four public bots; separate
+    because ParentBot's default scope is a refusal rather than a shorter menu.
+    """
+    try:
+        await application.bot.set_my_commands(STRANGER_COMMANDS)
+    except Exception:
+        logger.warning("Couldn't publish the public command menu.", exc_info=True)
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await application.bot.set_my_commands(
+                BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            logger.warning("Couldn't publish the owner's command menu to %s.",
+                           admin_id, exc_info=True)
+
+
+# The two lines a stranger meets before they press anything: the blurb beside
+# the bot in search results, and what an empty chat shows above the Start
+# button. The four public bots have had these since v1.4.0 and ParentBot was
+# skipped, on the reasoning that a private bot with one user has no audience
+# for them. That is the wrong way round -- the owner is the one person who
+# never reads them, and the stranger who has just found a bot called
+# "mumu manager" is exactly who they are for. Untranslated, like everything
+# else here: whoever is reading them is not a user of this bot.
+SHORT_DESCRIPTION = "A private bot. It looks after one person's other bots."
+
+
+def _description() -> str:
+    """Read off USERNAME_ALIASES rather than typed out again, so a bot that
+    gets renamed is renamed here too. ParentBot itself is left out: pointing
+    a stranger at the bot they are already looking at helps nobody."""
+    siblings = ", ".join(
+        "@" + USERNAME_ALIASES[bot["id"]][0]
+        for bot in CHILDREN if USERNAME_ALIASES.get(bot["id"])
+    )
+    return (
+        "This bot is not for general use and it will not answer you. It "
+        "watches the public bots in this family — whether they are up, what "
+        "they are doing, and when one of them breaks — and takes commands "
+        "from their owner only.\n\n"
+        f"The bots it looks after: {siblings}."
+    )
+
+
+async def _publish_profile(application):
+    """Never raises, same reasoning as the menu above."""
+    try:
+        await application.bot.set_my_short_description(SHORT_DESCRIPTION)
+        await application.bot.set_my_description(_description())
+    except Exception:
+        logger.warning("Couldn't publish ParentBot's profile text.", exc_info=True)
 
 
 async def _post_init(application):
     await tune_runtime(application)
     await lifecycle.on_start(BOT_NAME)
-    await application.bot.set_my_commands(BOT_COMMANDS)
+    await _publish_commands(application)
+    await _publish_profile(application)
 
 
 async def _post_stop(application):
@@ -1698,6 +1936,8 @@ def main():
 
     app.add_handler(CommandHandler(["start", "help"], start_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("usage", usage_command))
+    app.add_handler(CommandHandler("idle", idle_command))
     app.add_handler(CommandHandler("me", me_command))
     app.add_handler(CommandHandler("run", run_command))
     app.add_handler(CommandHandler("ping", broadcast_ping))

@@ -75,7 +75,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.4.0")
+VERSION = os.environ.get("FAMILY_VERSION", "1.5.0")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -221,6 +221,51 @@ def init_family_schema() -> None:
             f"CREATE INDEX IF NOT EXISTS idx_family_commands_queue "
             f"ON {FAMILY_SCHEMA}.commands (target_bot, status, id)"
         )
+        # What each bot has been costing, one row per sampling window.
+        #
+        # A heartbeat says a bot is alive; this says what being alive costs.
+        # On a host that bills resident memory by the second, "is it up" and
+        # "is it about to be too expensive to keep up" are different
+        # questions, and until this existed only the first had an answer --
+        # /status could say what the footprint is *right now*, which tells
+        # nobody whether that is normal.
+        #
+        # Deliberately narrow: no user ids, no message text, nothing about
+        # what anybody did. A count of updates, a count of distinct people,
+        # and four numbers read from the kernel.
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.usage_samples (
+                id BIGSERIAL PRIMARY KEY,
+                bot_id TEXT NOT NULL,
+                sampled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                window_minutes INTEGER NOT NULL,
+                rss_mb INTEGER,
+                peak_rss_mb INTEGER,
+                ceiling_mb INTEGER,
+                cpu_seconds INTEGER,
+                updates INTEGER NOT NULL DEFAULT 0,
+                users INTEGER NOT NULL DEFAULT 0,
+                sleepable_seconds INTEGER NOT NULL DEFAULT 0,
+                max_gap_seconds INTEGER NOT NULL DEFAULT 0,
+                jobs_ok INTEGER NOT NULL DEFAULT 0,
+                jobs_failed INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # Added after the table existed on a running family, so they arrive as
+        # ALTERs rather than as part of the CREATE. IF NOT EXISTS makes both
+        # paths idempotent, which is what lets every bot run this on startup
+        # without coordinating.
+        for column in ("sleepable_seconds", "max_gap_seconds", "jobs_ok", "jobs_failed"):
+            conn.execute(
+                f"ALTER TABLE {FAMILY_SCHEMA}.usage_samples "
+                f"ADD COLUMN IF NOT EXISTS {column} INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_family_usage_recent "
+            f"ON {FAMILY_SCHEMA}.usage_samples (bot_id, sampled_at DESC)"
+        )
         # ParentBot's memory of who was up last time it looked, so it can
         # alert on the *transition* (down -> up, up -> down) instead of
         # repeating "still down" every minute.
@@ -315,6 +360,12 @@ def write_heartbeat() -> None:
         conn.commit()
 
 
+# Usage samples are one small row per bot per window and are the only thing
+# here anybody will want to look *back* through, so they outlive the rest.
+# 45 days is a month and a half: long enough to compare this month with last.
+USAGE_RETENTION_DAYS = int(os.environ.get("FAMILY_USAGE_RETENTION_DAYS") or 45)
+
+
 def report_event(level: str, kind: str, message: str, details: str | None = None) -> None:
     """Blocking -- call it through asyncio.to_thread from async code, or
     just let report_event_soon() below do that for you.
@@ -334,6 +385,50 @@ def report_event(level: str, kind: str, message: str, details: str | None = None
     # bot reporting an event is usually in the middle of something the bus
     # cares about, and the pump runs its active cadence whenever ParentBot has
     # recently been busy.
+
+
+def record_usage(window_minutes: int, rss_mb, peak_rss_mb, ceiling_mb,
+                 cpu_seconds, updates: int, users: int, sleepable_seconds: int = 0,
+                 max_gap_seconds: int = 0, jobs_ok: int = 0, jobs_failed: int = 0) -> None:
+    """One sampling window's worth of what this process cost. Blocking.
+
+    Never raises: the whole point of this table is to notice a problem, and a
+    monitoring write that took the bot down with it would be the problem."""
+    if not _enabled:
+        return
+    with _connect() as conn:
+        conn.execute(
+            f"INSERT INTO {FAMILY_SCHEMA}.usage_samples "
+            f"(bot_id, window_minutes, rss_mb, peak_rss_mb, ceiling_mb, cpu_seconds, "
+            f"updates, users, sleepable_seconds, max_gap_seconds, jobs_ok, jobs_failed) "
+            f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (_bot_id, window_minutes, rss_mb, peak_rss_mb, ceiling_mb, cpu_seconds,
+             updates, users, sleepable_seconds, max_gap_seconds, jobs_ok, jobs_failed),
+        )
+        conn.commit()
+
+
+def usage_history(bot_id: str | None = None, hours: int = 24) -> list[dict]:
+    """Recent samples, newest first. `bot_id=None` means every bot, which is
+    what ParentBot asks for."""
+    if not _enabled:
+        return []
+    where = "sampled_at > now() - make_interval(hours => %s)"
+    params: tuple = (hours,)
+    if bot_id:
+        where += " AND bot_id = %s"
+        params += (bot_id,)
+    with _connect() as conn:
+        cur = conn.execute(
+            f"SELECT bot_id, sampled_at, window_minutes, rss_mb, peak_rss_mb, "
+            f"ceiling_mb, cpu_seconds, updates, users, sleepable_seconds, "
+            f"max_gap_seconds, jobs_ok, jobs_failed "
+            f"FROM {FAMILY_SCHEMA}.usage_samples WHERE {where} "
+            f"ORDER BY sampled_at DESC LIMIT 5000",
+            params,
+        )
+        names = [column.name for column in cur.description]
+        return [dict(zip(names, row)) for row in cur.fetchall()]
 
 
 def report_event_soon(level: str, kind: str, message: str, details: str | None = None) -> None:
@@ -996,13 +1091,19 @@ def _prune_family_rows() -> tuple[int, int]:
             (_bot_id, EVENT_RETENTION_DAYS),
         )
         events = cur.rowcount
+        cur = conn.execute(
+            f"DELETE FROM {FAMILY_SCHEMA}.usage_samples "
+            f"WHERE bot_id = %s AND sampled_at < now() - make_interval(days => %s)",
+            (_bot_id, USAGE_RETENTION_DAYS),
+        )
+        samples = cur.rowcount
         conn.commit()
-    return commands, events
+    return commands, events, samples
 
 
 def _prune() -> str:
-    commands, events = _prune_family_rows()
-    parts = [f"{commands} command(s)", f"{events} event(s)"]
+    commands, events, samples = _prune_family_rows()
+    parts = [f"{commands} command(s)", f"{events} event(s)", f"{samples} usage sample(s)"]
     own = getattr(db, "prune_old_data", None)
     if own is not None:
         parts.append(f"{own()} activity row(s)")

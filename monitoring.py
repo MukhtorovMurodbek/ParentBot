@@ -17,15 +17,17 @@ import logging
 import os
 import socket
 import sys
+import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 from telegram.error import BadRequest, NetworkError, RetryAfter
 
 import db
+import family_link
 import live_message
 
 _LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
@@ -227,6 +229,7 @@ async def track_activity(update, context) -> None:
     if not user:
         return
     _activity_buffer.add(user.id)
+    note_usage_update(user.id)
 
 
 WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "4"))
@@ -251,6 +254,10 @@ def attach_maintenance(app) -> None:
     job queue at all (see bot.py), so there is no degraded path here."""
     app.job_queue.run_repeating(
         _flush_activity_job, interval=ACTIVITY_FLUSH_SECONDS, first=ACTIVITY_FLUSH_SECONDS
+    )
+    app.job_queue.run_repeating(
+        _usage_sample_job, interval=USAGE_SAMPLE_MINUTES * 60,
+        first=USAGE_SAMPLE_MINUTES * 60 + 60,
     )
 
 
@@ -310,49 +317,299 @@ def _memory_ceiling_bytes() -> int | None:
     return None
 
 
-def _mb(value_bytes: float) -> str:
-    return f"{value_bytes / (1024 * 1024):.0f} MB"
+def footprint_numbers() -> dict:
+    """The same four readings process_footprint() prints, as numbers.
+
+    Separated out because a sentence is what a person wants and a number is
+    what a threshold and a database row want, and building the sentence twice
+    to parse it back would be the kind of thing that breaks silently in one
+    language and not another.
+
+    Any of them may be None: /proc is Linux, the cgroup file is a container,
+    and `resource` is not on Windows. A missing number means "not measurable
+    here", never zero -- zero would read as "free" to every caller.
+    """
+    resident = _read_first_int("/proc/self/status", "VmRSS:")
+    peak = _read_first_int("/proc/self/status", "VmHWM:")
+    ceiling = _memory_ceiling_bytes()
+    cpu = None
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu = usage.ru_utime + usage.ru_stime
+        if resident is None:
+            # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD, and it
+            # is a high-water mark rather than a live reading -- so it stands
+            # in for the peak, and there is no live number to report.
+            scale = 1 if sys.platform == "darwin" else 1024
+            peak = usage.ru_maxrss * scale // 1024
+    except Exception:
+        pass
+    return {
+        "rss_mb": None if resident is None else resident // 1024,
+        "peak_rss_mb": None if peak is None else peak // 1024,
+        "ceiling_mb": None if ceiling is None else ceiling // (1024 * 1024),
+        "cpu_seconds": None if cpu is None else int(cpu),
+    }
 
 
 def process_footprint() -> str:
     """One line: resident memory, its high-water mark, and CPU seconds burned
     since startup. Read /proc where it exists (Linux, which is what the
     deployed containers are) and fall back to getrusage elsewhere."""
+    numbers = footprint_numbers()
     parts = []
-
-    resident = _read_first_int("/proc/self/status", "VmRSS:")
-    peak = _read_first_int("/proc/self/status", "VmHWM:")
-    if resident is not None:
-        line = f"Memory: {_mb(resident * 1024)} resident"
-        if peak:
-            line += f" (peak {_mb(peak * 1024)})"
-        ceiling = _memory_ceiling_bytes()
-        if ceiling:
-            line += f" of {_mb(ceiling)} allowed"
+    if numbers["rss_mb"] is not None:
+        line = f"Memory: {numbers['rss_mb']} MB resident"
+        if numbers["peak_rss_mb"]:
+            line += f" (peak {numbers['peak_rss_mb']} MB)"
+        if numbers["ceiling_mb"]:
+            line += f" of {numbers['ceiling_mb']} MB allowed"
         parts.append(line)
-    else:
-        try:
-            import resource
-
-            usage = resource.getrusage(resource.RUSAGE_SELF)
-            # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
-            scale = 1 if sys.platform == "darwin" else 1024
-            parts.append(f"Memory: peak {_mb(usage.ru_maxrss * scale)}")
-        except Exception:
-            pass
-
-    try:
-        import resource
-
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu = usage.ru_utime + usage.ru_stime
-        parts.append(f"CPU: {cpu:.0f}s used since start")
-    except Exception:
-        pass
-
+    elif numbers["peak_rss_mb"] is not None:
+        parts.append(f"Memory: peak {numbers['peak_rss_mb']} MB")
+    if numbers["cpu_seconds"] is not None:
+        parts.append(f"CPU: {numbers['cpu_seconds']}s used since start")
+    trend = usage_trend_line()
+    if trend:
+        parts.append(trend)
     return " · ".join(parts) or "Footprint: not readable on this host"
 
 
+# ---------------------------------------------------------------------------
+# What it costs over time, and when that stops being normal
+# ---------------------------------------------------------------------------
+# /status answers "what is this process using right now", which on its own
+# tells nobody whether right now is unusual. This keeps a rolling window --
+# updates handled, distinct people, and the four kernel readings -- writes one
+# row per window into family.usage_samples, and raises an event when a window
+# is far enough from the others to be worth a message at 3am.
+#
+# Three things are worth being told about, and they are different questions:
+#
+#   memory headroom   the container is close to the limit it will be killed
+#                     for crossing. The only one of the three that is an
+#                     emergency.
+#   an activity spike a window with far more updates than the recent norm.
+#                     Could be a launch, could be one script. Either way the
+#                     owner would rather hear it from the bot than from the
+#                     bill.
+#   monthly reach     how many distinct people used it in thirty days, which
+#                     is the number that decides whether the plan it is on is
+#                     still the right one. Slow-moving, so it is checked once
+#                     a day and only ever mentioned when it crosses.
+#
+# Everything here is a count. No user ids, no chat ids, no text.
+
+USAGE_SAMPLE_MINUTES = int(os.environ.get("USAGE_SAMPLE_MINUTES") or 15)
+# How full the container has to be before it is worth saying so. 0.85 rather
+# than 0.95: the point is to arrive before the OOM kill, not with it.
+USAGE_MEMORY_WARN_RATIO = float(os.environ.get("USAGE_MEMORY_WARN_RATIO") or 0.85)
+# A window counts as a spike when it is this many times the median of the
+# recent ones AND clears the floor. The floor is what stops "2 updates, then
+# 12" from being an incident on a quiet bot -- which, on a bot this quiet, is
+# most of the time.
+USAGE_SPIKE_FACTOR = float(os.environ.get("USAGE_SPIKE_FACTOR") or 6.0)
+USAGE_SPIKE_FLOOR = int(os.environ.get("USAGE_SPIKE_FLOOR") or 60)
+# Distinct people in thirty days, past which the owner is told once. Not a
+# limit and nothing is refused; it is the number that means "the smallest
+# plan that fits may no longer be the smallest plan that fits".
+USAGE_MONTHLY_USERS_WARN = int(os.environ.get("USAGE_MONTHLY_USERS_WARN") or 400)
+# How long a host waits for silence before it stops charging for a container.
+# Railway sleeps a service after roughly five minutes with no *outbound*
+# traffic, so a gap between updates is only worth anything from the five-minute
+# mark onwards -- which is why this is subtracted from every gap rather than
+# the gaps simply being added up. Nothing in the bots sleeps yet; this measures
+# what sleeping *would* have saved, so the decision is made on this family's
+# own traffic rather than on a guess.
+SLEEP_AFTER_SECONDS = int(os.environ.get("SLEEP_AFTER_SECONDS") or 300)
+# A window where more than this fraction of the jobs failed is worth being told
+# about -- a job being a conversion, a download, a pack edit: whatever the bot
+# is for. The floor is again what stops one failure out of one being an
+# outage.
+USAGE_FAILURE_WARN_RATIO = float(os.environ.get("USAGE_FAILURE_WARN_RATIO") or 0.5)
+USAGE_FAILURE_FLOOR = int(os.environ.get("USAGE_FAILURE_FLOOR") or 4)
+# How many recent windows the spike test compares against, and how long an
+# alarm of one kind stays quiet after firing.
+_USAGE_WINDOW_MEMORY = 24
+_ALARM_QUIET_SECONDS = {"memory": 3600, "spike": 3600, "monthly_users": 86400,
+                        "failures": 1800}
+
+_usage_updates = 0
+_usage_users: set[int] = set()
+_usage_recent: "deque[int]" = deque(maxlen=_USAGE_WINDOW_MEMORY)
+_usage_alarmed: dict[str, float] = {}
+# The gap clock. monotonic() rather than time(): this measures a duration, and
+# a clock that can be stepped by NTP would make one negative.
+_usage_last_update = time.monotonic()
+_usage_sleepable = 0.0
+_usage_max_gap = 0.0
+_usage_jobs_ok = 0
+_usage_jobs_failed = 0
+
+
+def note_usage_update(user_id: int | None) -> None:
+    """One update happened. Called from track_activity, so it is on the path
+    of every update there is -- it adds an int to a set and increments a
+    couple of counters, and must never do anything more expensive than that."""
+    global _usage_updates, _usage_last_update, _usage_sleepable, _usage_max_gap
+    _usage_updates += 1
+    now = time.monotonic()
+    gap = now - _usage_last_update
+    _usage_last_update = now
+    _usage_max_gap = max(_usage_max_gap, gap)
+    _usage_sleepable += max(0.0, gap - SLEEP_AFTER_SECONDS)
+    if user_id is not None and len(_usage_users) < 10000:
+        _usage_users.add(user_id)
+
+
+def note_job(ok: bool) -> None:
+    """One unit of the thing this bot is for finished -- a conversion, a
+    download, a pack edit. Two counters and nothing else.
+
+    What is deliberately NOT here: what was converted, which link, whose it
+    was, or why it failed. The question this answers is "is the bot still
+    working", and that needs a ratio, not a record. Per-route detail already
+    lives where it belongs -- DownloaderBot's provider health, and every
+    bot's error log."""
+    global _usage_jobs_ok, _usage_jobs_failed
+    if ok:
+        _usage_jobs_ok += 1
+    else:
+        _usage_jobs_failed += 1
+
+
+def _alarm_due(kind: str) -> bool:
+    now = time.time()
+    if now - _usage_alarmed.get(kind, 0) < _ALARM_QUIET_SECONDS.get(kind, 3600):
+        return False
+    _usage_alarmed[kind] = now
+    return True
+
+
+def _median(values) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def usage_trend_line() -> str:
+    """One line for /status: what the recent windows looked like, so the
+    number above it has something to be compared with."""
+    if not _usage_recent:
+        return ""
+    quiet = int(time.monotonic() - _usage_last_update)
+    return (f"Recent: {sum(_usage_recent)} update(s) over the last "
+            f"{len(_usage_recent)} window(s) of {USAGE_SAMPLE_MINUTES} min · "
+            f"quiet for {quiet // 60}m {quiet % 60}s")
+
+
+def _monthly_users() -> int | None:
+    """Distinct people in the last thirty days, if this bot's db can say."""
+    counter = getattr(db, "count_active_users_since", None)
+    if counter is None:
+        return None
+    try:
+        return counter(datetime.now(timezone.utc) - timedelta(days=30))
+    except Exception:
+        return None
+
+
+def _check_usage_alarms(numbers: dict, updates: int, users: int,
+                        jobs_ok: int = 0, jobs_failed: int = 0) -> None:
+    """Blocking; runs in the same thread as the sample write."""
+    jobs = jobs_ok + jobs_failed
+    if (jobs >= USAGE_FAILURE_FLOOR
+            and jobs_failed / jobs >= USAGE_FAILURE_WARN_RATIO
+            and _alarm_due("failures")):
+        family_link.report_event(
+            "warning" if jobs_ok else "error", "job_failures",
+            f"{jobs_failed} of {jobs} job(s) failed in the last "
+            f"{USAGE_SAMPLE_MINUTES} min"
+            + ("." if jobs_ok else " -- none succeeded."),
+            "A job is whatever this bot is for: a conversion, a download, a pack "
+            "edit. All of them failing usually means something outside the bot "
+            "stopped answering rather than something inside it breaking.",
+        )
+    ceiling = numbers.get("ceiling_mb")
+    peak = numbers.get("peak_rss_mb")
+    if ceiling and peak and peak >= ceiling * USAGE_MEMORY_WARN_RATIO and _alarm_due("memory"):
+        family_link.report_event(
+            "warning", "memory_headroom",
+            f"Memory peaked at {peak} MB of {ceiling} MB allowed "
+            f"({peak / ceiling:.0%} of the limit).",
+            "Crossing the limit is an out-of-memory kill rather than a slow reply. "
+            "Either something is holding more than it should, or this service has "
+            "outgrown its plan.",
+        )
+
+    baseline = _median(_usage_recent)
+    if (updates >= USAGE_SPIKE_FLOOR and baseline > 0
+            and updates >= baseline * USAGE_SPIKE_FACTOR and _alarm_due("spike")):
+        family_link.report_event(
+            "warning", "activity_spike",
+            f"{updates} updates from {users} person(s) in {USAGE_SAMPLE_MINUTES} min, "
+            f"against a recent median of {baseline:.0f}.",
+            "Could be a launch and could be one script. /status and the usage table "
+            "have the shape of it.",
+        )
+
+    monthly = _monthly_users()
+    if monthly is not None and monthly >= USAGE_MONTHLY_USERS_WARN and _alarm_due("monthly_users"):
+        family_link.report_event(
+            "warning", "monthly_users",
+            f"{monthly} distinct people used this bot in the last 30 days, "
+            f"past the {USAGE_MONTHLY_USERS_WARN} mark.",
+            "Nothing is refused and nothing is broken. It is the number that decides "
+            "whether the plan this runs on is still the right one.",
+        )
+
+
+def _sample_usage_now() -> None:
+    """One window: write the row, then decide whether to say anything.
+
+    The counters are taken and reset first, so a slow database cannot make
+    the next window count this one's updates twice."""
+    global _usage_updates, _usage_users
+    updates, users = _usage_updates, len(_usage_users)
+    _usage_updates, _usage_users = 0, set()
+    numbers = footprint_numbers()
+    global _usage_sleepable, _usage_max_gap, _usage_jobs_ok, _usage_jobs_failed
+    # The window ends with a gap in progress. Counting it now, and starting the
+    # next window's clock from here, is what stops a bot that was quiet for six
+    # hours reporting six hours of sleepable time in one window and none in the
+    # twenty-three before it.
+    global _usage_last_update
+    now = time.monotonic()
+    trailing = now - _usage_last_update
+    sleepable = int(_usage_sleepable + max(0.0, trailing - SLEEP_AFTER_SECONDS))
+    max_gap = int(max(_usage_max_gap, trailing))
+    jobs_ok, jobs_failed = _usage_jobs_ok, _usage_jobs_failed
+    _usage_sleepable, _usage_max_gap = 0.0, 0.0
+    _usage_jobs_ok, _usage_jobs_failed = 0, 0
+    _usage_last_update = now
+    try:
+        family_link.record_usage(
+            USAGE_SAMPLE_MINUTES, numbers["rss_mb"], numbers["peak_rss_mb"],
+            numbers["ceiling_mb"], numbers["cpu_seconds"], updates, users,
+            sleepable, max_gap, jobs_ok, jobs_failed,
+        )
+    except Exception:
+        logging.getLogger(__name__).debug("Usage sample not written", exc_info=True)
+    try:
+        _check_usage_alarms(numbers, updates, users, jobs_ok, jobs_failed)
+    except Exception:
+        logging.getLogger(__name__).debug("Usage alarm check failed", exc_info=True)
+    _usage_recent.append(updates)
+
+
+async def _usage_sample_job(context) -> None:
+    await asyncio.to_thread(_sample_usage_now)
 def build_status_text(start_time: datetime, users_last_hour: int, users_since_start: int) -> str:
     now = datetime.now(timezone.utc)
     uptime = now - start_time
