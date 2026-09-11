@@ -88,7 +88,7 @@ def resolve_dsn(alias_or_url: str) -> str:
     if not dsn:
         sys.exit(
             f"Don't know a database called '{alias_or_url}'. Pass a full postgresql:// URL, "
-            f"or set {alias.upper()}_DATABASE_URL in your environment or in parent_bot/.env."
+            f"or set {alias.upper()}_DATABASE_URL in your environment or in manager_bot/.env."
         )
     return dsn
 
@@ -141,8 +141,12 @@ def backup(dsn: str, out_path: Path, schemas: list[str] | None) -> None:
         "format": "csv-copy-v1",
         "tables": [],
     }
+    # Level 9: CSV is most of what a database is, it compresses several
+    # times over, and the archive is made rarely and kept a long time --
+    # including as a Telegram document, where every megabyte under the 50 MB
+    # ceiling is a part fewer to join back together.
     with closing(psycopg.connect(dsn)) as conn, zipfile.ZipFile(
-        out_path, "w", zipfile.ZIP_DEFLATED
+        out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9
     ) as zf:
         tables = list_tables(conn, schemas)
         if not tables:

@@ -1,14 +1,14 @@
-"""ParentBot's own logging / crash tracking / activity tracking.
+"""ManagerBot's own logging / crash tracking / activity tracking.
 
 This is the monitoring half of the other four bots' shared_features.py,
-copied here without the halves ParentBot has no use for (donations, the
-sibling-bot cross-promotion, i18n -- ParentBot has exactly one user and
+copied here without the halves ManagerBot has no use for (donations, the
+sibling-bot cross-promotion, i18n -- ManagerBot has exactly one user and
 speaks one language). family_link.py looks for a module named either
 `shared_features` or `monitoring` and uses whichever it finds, which is why
 this file keeps the same function names.
 
-Keeping ParentBot on the same vocabulary matters: a bot that watches the
-others should be watched by exactly the same machinery, so "ParentBot has
+Keeping ManagerBot on the same vocabulary matters: a bot that watches the
+others should be watched by exactly the same machinery, so "ManagerBot has
 been quietly crashing" is as visible as it would be for any of them.
 """
 import asyncio
@@ -121,8 +121,21 @@ _network_blips_total = 0  # since this process started
 _network_alerted = False
 
 
+# PTB raises Telegram's HTTP 413 -- "Request Entity Too Large" -- as a plain
+# NetworkError, so it matched the tuple above and was filed as a flaky
+# connection. It is the opposite: permanent, and the same upload fails every
+# time. That is how two successful ConvertBot conversions of a 200 MP photo
+# vanished -- result converted, upload refused, error handler said "retried
+# by PTB", user told nothing, credit kept. Anything whose text says the
+# payload is too big is a real failure, whatever class it arrived as.
+PERMANENT_NETWORK_MESSAGES = ("entity too large", "file is too big", "too big", "too large")
+
+
 def is_transient_network_error(exc: BaseException) -> bool:
-    return isinstance(exc, TRANSIENT_NETWORK_ERRORS) and not isinstance(exc, BadRequest)
+    if not isinstance(exc, TRANSIENT_NETWORK_ERRORS) or isinstance(exc, BadRequest):
+        return False
+    text = str(exc).lower()
+    return not any(marker in text for marker in PERMANENT_NETWORK_MESSAGES)
 
 
 def note_network_blip(exc: BaseException) -> None:
@@ -161,7 +174,7 @@ def record_error(exc: BaseException) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     _recent_errors.append((stamp, repr(exc)))
     emit_event(
-        "error", "crash", f"ParentBot itself hit an unhandled {type(exc).__name__}: {exc}",
+        "error", "crash", f"ManagerBot itself hit an unhandled {type(exc).__name__}: {exc}",
         "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
     )
 
@@ -181,7 +194,19 @@ def error_summary() -> str:
 
 
 async def error_handler(update, context) -> None:
-    if is_transient_network_error(context.error):
+    """Register with Application.add_error_handler in each bot's main() --
+    this is PTB's global hook for exceptions that escape a handler callback
+    uncaught (i.e. actual crashes, not the try/except'd, user-facing errors
+    already handled inline elsewhere).
+
+    A dropped long poll reaches here too, and is not a crash -- see
+    is_transient_network_error above."""
+    # Only a failure with no update behind it is the long poll. A network
+    # error raised while handling somebody's message means that person asked
+    # for something and did not get it, and that is not a blip however
+    # transient its cause: it is counted, logged with its traceback, and
+    # reported like any other failure.
+    if update is None and is_transient_network_error(context.error):
         note_network_blip(context.error)
         return
     logging.getLogger(__name__).error("Unhandled exception while processing an update", exc_info=context.error)
@@ -191,8 +216,8 @@ async def error_handler(update, context) -> None:
 # ---------------------------------------------------------------------------
 # Active-user tracking, buffered -- see shared_features.py for the reasoning
 # ---------------------------------------------------------------------------
-# ParentBot has one user, so the saving here is small in absolute terms. It is
-# kept identical anyway: the whole point of this file is that ParentBot is
+# ManagerBot has one user, so the saving here is small in absolute terms. It is
+# kept identical anyway: the whole point of this file is that ManagerBot is
 # measured by exactly the same machinery as the bots it watches, and a
 # divergence here is a divergence in what /status means.
 ACTIVITY_FLUSH_SECONDS = int(os.environ.get("ACTIVITY_FLUSH_SECONDS", "60"))
@@ -250,7 +275,7 @@ async def tune_runtime(application) -> None:
 
 
 def attach_maintenance(app) -> None:
-    """One line in ParentBot's main(). ParentBot refuses to start without a
+    """One line in ManagerBot's main(). ManagerBot refuses to start without a
     job queue at all (see bot.py), so there is no degraded path here."""
     app.job_queue.run_repeating(
         _flush_activity_job, interval=ACTIVITY_FLUSH_SECONDS, first=ACTIVITY_FLUSH_SECONDS

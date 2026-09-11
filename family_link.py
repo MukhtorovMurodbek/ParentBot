@@ -1,7 +1,7 @@
-"""The family bus: how one bot talks to ParentBot, and how ParentBot talks
+"""The family bus: how one bot talks to ManagerBot, and how ManagerBot talks
 back.
 
-Every bot in the family (the four public ones and ParentBot itself) keeps
+Every bot in the family (the four public ones and ManagerBot itself) keeps
 this file, byte-identical, exactly like shared_features.py -- the bots stay
 independent processes with independent repos, so nothing is imported across
 folders. What they *do* share is one Postgres database, and this module is
@@ -14,33 +14,33 @@ Layout of that shared database:
     convert_bot.*   ConvertBot's own tables
     downloader_bot.*
     anon_bot.*
-    parent_bot.*    ParentBot's own tables
+    manager_bot.*    ManagerBot's own tables
 
 One Postgres schema per bot means the four bots' identically-named tables
 (user_settings, star_transactions, activity_events, ...) never collide, and
 no bot's SQL had to change -- each connects with its own search_path (see
-db.py's DB_SCHEMA). ParentBot is the only process that reads across schemas.
+db.py's DB_SCHEMA). ManagerBot is the only process that reads across schemas.
 
 Three things flow over this bus:
 
   1. **Heartbeats** -- every HEARTBEAT_SECONDS each bot stamps
      family.heartbeats with "still alive, started at X, N errors so far".
-     ParentBot decides a bot is down when that stamp goes stale, which
+     ManagerBot decides a bot is down when that stamp goes stale, which
      works whether the bot crashed, was OOM-killed, lost its network, or
      was never started at all. No open ports, no HTTP between services.
 
-  2. **Events** -- anything ParentBot should tell the owner about lands in
+  2. **Events** -- anything ManagerBot should tell the owner about lands in
      family.events (an unhandled exception, a startup, a donation).
-     ParentBot polls for undelivered ones and forwards them as a DM.
+     ManagerBot polls for undelivered ones and forwards them as a DM.
 
-  3. **Commands** -- ParentBot inserts a row in family.commands aimed at
+  3. **Commands** -- ManagerBot inserts a row in family.commands aimed at
      one bot; that bot polls for it (fast while the bus is busy, every
      FAMILY_BUS_POLL_IDLE_SECONDS otherwise), runs it, and writes the answer
-     back into the same row. This is how ParentBot
+     back into the same row. This is how ManagerBot
      runs another bot's owner-only commands (/status, /dbdump, /whois,
      /messageas, ...) without either process needing to reach the other
      over the network. A command aimed at a bot that is down simply stays
-     pending until ParentBot times it out and says so.
+     pending until ManagerBot times it out and says so.
 
 Every bot also tidies up after itself here, on a slow timer: its own
 finished rows in family.commands (which carry file payloads -- a delivered
@@ -62,6 +62,7 @@ import logging
 import os
 import socket
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -75,7 +76,7 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.5.0")
+VERSION = os.environ.get("FAMILY_VERSION", "1.6.0")
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -137,7 +138,7 @@ HOSTNAME = socket.gethostname()
 
 # How long finished command rows and delivered events are kept before this bot
 # tidies up after itself. The command queue carries BYTEA payloads (a /dbdump
-# zip on its way to ParentBot), so letting it grow forever means paying to
+# zip on its way to ManagerBot), so letting it grow forever means paying to
 # store megabytes of files that were already delivered.
 COMMAND_RETENTION_HOURS = int(os.environ.get("FAMILY_COMMAND_RETENTION_HOURS", "24"))
 EVENT_RETENTION_DAYS = int(os.environ.get("FAMILY_EVENT_RETENTION_DAYS", "30"))
@@ -159,8 +160,8 @@ def _connect():
 
 def init_family_schema() -> None:
     """Idempotent; every bot calls it at startup, whoever gets there first
-    wins. Kept here rather than in ParentBot alone so a bot started on its
-    own (no parent running yet) still has somewhere to write."""
+    wins. Kept here rather than in ManagerBot alone so a bot started on its
+    own (no manager running yet) still has somewhere to write."""
     with _connect() as conn:
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {FAMILY_SCHEMA}")
         conn.execute(
@@ -266,7 +267,7 @@ def init_family_schema() -> None:
             f"CREATE INDEX IF NOT EXISTS idx_family_usage_recent "
             f"ON {FAMILY_SCHEMA}.usage_samples (bot_id, sampled_at DESC)"
         )
-        # ParentBot's memory of who was up last time it looked, so it can
+        # ManagerBot's memory of who was up last time it looked, so it can
         # alert on the *transition* (down -> up, up -> down) instead of
         # repeating "still down" every minute.
         conn.execute(
@@ -286,7 +287,586 @@ def init_family_schema() -> None:
             )
             """
         )
+        # One Stars balance per person, for the whole family.
+        #
+        # It lives here rather than in a bot's own schema because that is the
+        # whole point of it: stars put in through StickerBot are spent in
+        # ConvertBot, and neither bot owns them. A per-bot balance would be
+        # five wallets somebody has to top up separately, which is worse than
+        # the per-job invoice it replaces.
+        #
+        # `balance` is in CREDITS, not Stars, and the two are not the same
+        # unit: paying Stars buys a multiple of them (TOPUP_MULTIPLIER), so a
+        # balance is always larger than the money behind it and can never be
+        # paid back out. That is why `lifetime_stars_paid` is a column of its
+        # own -- it is the only figure here denominated in real money, and it
+        # is the one to ask "has this person ever paid". Credits can arrive as
+        # a grant or a welcome bonus, and counting those as a payment is how a
+        # gift turns into a claim that somebody donated.
+        #
+        # The lifetime columns exist so a balance of 40 can be explained --
+        # topped up 100, spent 60 -- without reading the whole ledger, and so
+        # that an adjustment cannot inflate what somebody appears to have
+        # paid: they grow on real top-ups, bonuses and spends, never on an
+        # owner's correction.
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.star_balances (
+                user_id BIGINT PRIMARY KEY,
+                balance BIGINT NOT NULL DEFAULT 0,
+                lifetime_topped_up BIGINT NOT NULL DEFAULT 0,
+                lifetime_spent BIGINT NOT NULL DEFAULT 0,
+                lifetime_stars_paid BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Every movement, and why. A balance with no ledger behind it is a
+        # number nobody can defend: the first question anybody asks about a
+        # wallet is "where did the other sixty go", and the answer has to be
+        # a list of dated lines rather than an assurance.
+        #
+        # `balance_after` is redundant on purpose. It makes the ledger
+        # self-checking -- the newest row's balance_after must equal the
+        # balance, and each row's must equal the one before it plus the delta
+        # -- so a bug that debits without recording, or records without
+        # debiting, is visible instead of merely suspected.
+        #
+        # `stars_paid` on a row is the real money behind that movement, so
+        # the ledger can answer "what was actually charged" separately from
+        # "what was credited" -- which is what a refund has to be reasoned
+        # about in, and what a promotion rate makes different numbers.
+        #
+        # This is a payment record and is **not pruned and not erased**, for
+        # the same reason star_transactions is not: it is what a refund is
+        # issued against and what the totals are counted from. It holds a
+        # numeric id, an amount and a reason, and nothing anybody wrote.
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.star_ledger (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                bot_id TEXT NOT NULL,
+                delta BIGINT NOT NULL,
+                reason TEXT NOT NULL,
+                detail TEXT,
+                stars_paid BIGINT NOT NULL DEFAULT 0,
+                balance_after BIGINT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_family_star_ledger_user "
+            f"ON {FAMILY_SCHEMA}.star_ledger (user_id, id DESC)"
+        )
+        # Bonus credit, one row per payment that earned some. The balance
+        # above is the only figure anything spends from; this is what says how
+        # much of it is bonus and when that part runs out. Spending takes from
+        # the soonest-expiring lot first, so what a person loses to expiry is
+        # only ever bonus they had not got round to using.
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.star_bonus_lots (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount BIGINT NOT NULL,
+                remaining BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_family_bonus_lots_user "
+            f"ON {FAMILY_SCHEMA}.star_bonus_lots (user_id, expires_at)"
+        )
+        # Problem reports people choose to send (see problems.py). Nothing in
+        # a row identifies anybody: which bot, the code, the incident, when it
+        # happened, and the version. One row per incident, so a double tap
+        # stores and notifies once.
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.problem_reports (
+                id BIGSERIAL PRIMARY KEY,
+                bot_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                incident TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ,
+                reported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                version TEXT,
+                UNIQUE (bot_id, incident)
+            )
+            """
+        )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# The credit balance
+# ---------------------------------------------------------------------------
+# Everything anybody pays goes into a balance, and everything the family
+# charges for comes out of one. There is exactly one rail, and it is the same
+# rail for the owner as for a stranger.
+#
+# **A balance is credit, not Stars.** Paying Stars buys credit at a rate above
+# one-for-one, so a balance shown as "⭐" would claim a person holds Stars they
+# could take back out. Credit is "⚡" and Stars stay "⭐", everywhere.
+#
+# **Payments are final.** The owner decided there are no refunds of Stars
+# payments, and every place a person pays says so before they do. The only
+# credit that ever comes back is a conversion's own charge, returned to the
+# balance when the bot fails it -- that is not a refund of money.
+#
+# How much a payment buys is a lifetime ladder, in the owner's words:
+# "however many times the user recharges, the first 500 stars will give 3x and
+# the next 500 gives 2x usage." Read as a multiplier on the ordinary rate, so
+# every clause means something: somebody's first 500 Stars ever buy 6 ⚡ each,
+# the next 500 buy 4 ⚡, and after that 2 ⚡. Across all their payments, not per
+# payment -- paying 100 five times earns exactly what paying 500 once does.
+#
+# The part of a payment above the ordinary rate is **bonus credit** and it
+# expires (FAMILY_BONUS_EXPIRY_DAYS, 90 by default); the ordinary part never
+# does. "Only the bonus credit should expire" was the owner's instruction.
+
+TOPUP_MULTIPLIER = float(os.environ.get("FAMILY_TOPUP_MULTIPLIER", "2"))
+
+
+def _parse_ladder(spec: str) -> list:
+    steps = []
+    for part in (spec or "").split(","):
+        stars, _, multiplier = part.strip().partition(":")
+        try:
+            steps.append((int(stars), float(multiplier)))
+        except ValueError:
+            continue
+    return [(stars, multiplier) for stars, multiplier in steps if stars > 0 and multiplier >= 1]
+
+
+# "stars:multiplier" segments of a person's lifetime Stars, in order; after the
+# last one the multiplier is 1. Empty turns bonuses off.
+TOPUP_LADDER = _parse_ladder(os.environ.get("FAMILY_TOPUP_LADDER", "500:3,500:2"))
+BONUS_EXPIRY_DAYS = int(os.environ.get("FAMILY_BONUS_EXPIRY_DAYS", "90"))
+
+# Every reason a balance can move, so that a typo becomes a failure here
+# rather than a row nobody can group by later.
+LEDGER_REASONS = ("topup", "bonus", "grant", "spend", "refund", "adjustment", "expired")
+
+
+def credit_for_stars(stars: int) -> int:
+    """The ordinary credit `stars` buy, with no bonus -- the part that never
+    expires."""
+    return int(round(stars * TOPUP_MULTIPLIER, 6))
+
+
+def _ladder_ranges():
+    start = 0
+    for size, multiplier in TOPUP_LADDER:
+        yield start, start + size, multiplier
+        start += size
+    yield start, None, 1.0
+
+
+def quote_credit(lifetime_paid: int, stars: int) -> dict:
+    """What paying `stars` earns for somebody who has already paid
+    `lifetime_paid` Stars, split into the ordinary part and the bonus.
+
+    A payment that straddles a step is priced piece by piece: 400 Stars from
+    somebody at 300 buys 200 at 3x and 200 at 2x."""
+    low, high = max(0, lifetime_paid), max(0, lifetime_paid) + max(0, stars)
+    total = 0.0
+    for start, end, multiplier in _ladder_ranges():
+        overlap_low = max(start, low)
+        overlap_high = high if end is None else min(end, high)
+        if overlap_high > overlap_low:
+            total += (overlap_high - overlap_low) * TOPUP_MULTIPLIER * multiplier
+    base = credit_for_stars(stars)
+    total_credit = max(int(round(total, 6)), base)
+    return {"stars": stars, "base": base, "bonus": total_credit - base, "total": total_credit}
+
+
+def ladder_position(lifetime_paid: int) -> tuple:
+    """(multiplier the next Star earns, Stars left at that multiplier). The
+    second is None once past the ladder."""
+    for start, end, multiplier in _ladder_ranges():
+        if end is None or lifetime_paid < end:
+            return multiplier, (None if end is None else end - max(lifetime_paid, start))
+    return 1.0, None
+
+
+def _ledger_bot() -> str:
+    """Which bot a movement is recorded against. `attach()` has run by the
+    time anybody spends anything; a movement before that is still worth
+    recording, under a name that says it could not be attributed."""
+    return _bot_id or "unattached"
+
+
+def _ledger_in(conn, user_id, delta, reason, detail, stars_paid, balance_after) -> None:
+    conn.execute(
+        f"INSERT INTO {FAMILY_SCHEMA}.star_ledger "
+        f"(user_id, bot_id, delta, reason, detail, stars_paid, balance_after) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (user_id, _ledger_bot(), delta, reason, detail, stars_paid, balance_after),
+    )
+
+
+def _lock_wallet_in(conn, user_id) -> int:
+    """Make sure the wallet exists and hold it for this transaction. Every
+    change to a balance goes through here first, so two bots touching one
+    wallet at the same moment take turns instead of racing."""
+    conn.execute(
+        f"INSERT INTO {FAMILY_SCHEMA}.star_balances (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+        (user_id,),
+    )
+    return int(conn.execute(
+        f"SELECT balance FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s FOR UPDATE",
+        (user_id,),
+    ).fetchone()[0])
+
+
+def _expire_in(conn, user_id) -> int:
+    """Take away this person's bonus credit that has run out. Returns how
+    much. Called at the start of anything that reads or moves a balance, so
+    an expired bonus is never spendable even between housekeeping passes."""
+    due = conn.execute(
+        f"SELECT id, remaining FROM {FAMILY_SCHEMA}.star_bonus_lots "
+        f"WHERE user_id = %s AND remaining > 0 AND expires_at <= now() FOR UPDATE",
+        (user_id,),
+    ).fetchall()
+    total = sum(int(row[1]) for row in due)
+    if not total:
+        return 0
+    conn.execute(
+        f"UPDATE {FAMILY_SCHEMA}.star_bonus_lots SET remaining = 0 WHERE id = ANY(%s)",
+        ([row[0] for row in due],),
+    )
+    after = conn.execute(
+        f"UPDATE {FAMILY_SCHEMA}.star_balances SET balance = balance - %s, updated_at = now() "
+        f"WHERE user_id = %s RETURNING balance",
+        (total, user_id),
+    ).fetchone()[0]
+    _ledger_in(conn, user_id, -total, "expired", "bonus credit expired", 0, int(after))
+    return total
+
+
+def _take_bonus_in(conn, user_id, amount) -> None:
+    """Reduce this person's unexpired bonus by `amount`, soonest to expire
+    first. What is spent is bonus before it is ordinary credit, so what
+    expiry takes is only bonus nobody got round to using."""
+    if amount <= 0:
+        return
+    lots = conn.execute(
+        f"SELECT id, remaining FROM {FAMILY_SCHEMA}.star_bonus_lots "
+        f"WHERE user_id = %s AND remaining > 0 AND expires_at > now() "
+        f"ORDER BY expires_at, id FOR UPDATE",
+        (user_id,),
+    ).fetchall()
+    for lot_id, remaining in lots:
+        if amount <= 0:
+            break
+        taken = min(int(remaining), amount)
+        conn.execute(
+            f"UPDATE {FAMILY_SCHEMA}.star_bonus_lots SET remaining = remaining - %s WHERE id = %s",
+            (taken, lot_id),
+        )
+        amount -= taken
+
+
+def _bonus_in(conn, user_id) -> int:
+    return int(conn.execute(
+        f"SELECT coalesce(sum(remaining), 0) FROM {FAMILY_SCHEMA}.star_bonus_lots "
+        f"WHERE user_id = %s AND remaining > 0 AND expires_at > now()",
+        (user_id,),
+    ).fetchone()[0])
+
+
+def _cap_bonus_in(conn, user_id, balance) -> None:
+    """After a balance goes down for any reason but a spend, bonus cannot be
+    more than what is left -- or its expiry would later take away credit
+    that is not there."""
+    excess = _bonus_in(conn, user_id) - max(balance, 0)
+    _take_bonus_in(conn, user_id, excess)
+
+
+def _move_in(conn, user_id, delta, reason, detail, stars_paid=0) -> int:
+    earned = delta if reason in ("topup", "bonus", "grant") and delta > 0 else 0
+    after = int(conn.execute(
+        f"UPDATE {FAMILY_SCHEMA}.star_balances "
+        f"SET balance = balance + %s, lifetime_topped_up = lifetime_topped_up + %s, "
+        f"lifetime_stars_paid = lifetime_stars_paid + %s, updated_at = now() "
+        f"WHERE user_id = %s RETURNING balance",
+        (delta, earned, stars_paid, user_id),
+    ).fetchone()[0])
+    _ledger_in(conn, user_id, delta, reason, detail, stars_paid, after)
+    return after
+
+
+def star_balance(user_id: int) -> int:
+    """What this person has, in credits, after any expired bonus is gone."""
+    with _connect() as conn:
+        exists = conn.execute(
+            f"SELECT 1 FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s", (user_id,)).fetchone()
+        if not exists:
+            return 0
+        _lock_wallet_in(conn, user_id)
+        _expire_in(conn, user_id)
+        balance = int(conn.execute(
+            f"SELECT balance FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s", (user_id,)
+        ).fetchone()[0])
+        conn.commit()
+    return balance
+
+
+def star_totals(user_id: int) -> dict:
+    """Balance, lifetime figures, and how much of the balance is bonus with
+    when the next of it expires. `stars_paid` is the only figure in real
+    Stars, and it is what the ladder is counted from."""
+    empty = {"balance": 0, "topped_up": 0, "spent": 0, "stars_paid": 0,
+             "bonus": 0, "bonus_next_amount": 0, "bonus_next_expiry": None}
+    with _connect() as conn:
+        exists = conn.execute(
+            f"SELECT 1 FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s", (user_id,)).fetchone()
+        if not exists:
+            return empty
+        _lock_wallet_in(conn, user_id)
+        _expire_in(conn, user_id)
+        row = conn.execute(
+            f"SELECT balance, lifetime_topped_up, lifetime_spent, lifetime_stars_paid "
+            f"FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s", (user_id,)
+        ).fetchone()
+        nxt = conn.execute(
+            f"SELECT expires_at, sum(remaining) FROM {FAMILY_SCHEMA}.star_bonus_lots "
+            f"WHERE user_id = %s AND remaining > 0 AND expires_at > now() "
+            f"GROUP BY expires_at ORDER BY expires_at LIMIT 1", (user_id,)
+        ).fetchone()
+        bonus = _bonus_in(conn, user_id)
+        conn.commit()
+    return {"balance": int(row[0]), "topped_up": int(row[1]), "spent": int(row[2]),
+            "stars_paid": int(row[3]), "bonus": bonus,
+            "bonus_next_amount": int(nxt[1]) if nxt else 0,
+            "bonus_next_expiry": nxt[0] if nxt else None}
+
+
+def quote_topup(user_id: int, stars: int) -> dict:
+    """quote_credit for this person, from what they have paid so far. For
+    the sentence before a payment; topup() prices it again under a lock."""
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT lifetime_stars_paid FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+    return quote_credit(int(row[0]) if row else 0, stars)
+
+
+def move_stars(user_id: int, delta: int, reason: str, detail: str | None = None,
+               stars_paid: int = 0) -> int:
+    """Add `delta` credits to a balance and record why. Returns the new
+    balance. Negative deltas are allowed and may take a balance below zero,
+    which simply means no paid work until it is positive again. What arrives
+    this way is ordinary credit and never expires; only topup() creates
+    bonus."""
+    if reason not in LEDGER_REASONS:
+        raise ValueError(f"unknown ledger reason {reason!r}; add it to LEDGER_REASONS")
+    if delta == 0 and not stars_paid:
+        return star_balance(user_id)
+    with _connect() as conn:
+        _lock_wallet_in(conn, user_id)
+        _expire_in(conn, user_id)
+        after = _move_in(conn, user_id, delta, reason, detail, stars_paid)
+        if delta < 0:
+            _cap_bonus_in(conn, user_id, after)
+        conn.commit()
+    return after
+
+
+def spend_stars(user_id: int, amount: int, reason: str = "spend",
+                detail: str | None = None) -> "int | None":
+    """Take `amount` credits off a balance if it covers it. Returns the new
+    balance, or None if it does not. The check happens under the wallet's
+    lock, so two jobs racing for the last of a balance cannot both win.
+    Bonus is used before ordinary credit."""
+    if amount <= 0:
+        return star_balance(user_id)
+    with _connect() as conn:
+        balance = _lock_wallet_in(conn, user_id)
+        balance -= _expire_in(conn, user_id)
+        if balance < amount:
+            conn.commit()
+            return None
+        after = int(conn.execute(
+            f"UPDATE {FAMILY_SCHEMA}.star_balances SET balance = balance - %s, "
+            f"lifetime_spent = lifetime_spent + %s, updated_at = now() "
+            f"WHERE user_id = %s RETURNING balance",
+            (amount, amount, user_id),
+        ).fetchone()[0])
+        _ledger_in(conn, user_id, -amount, reason, detail, 0, after)
+        _take_bonus_in(conn, user_id, amount)
+        conn.commit()
+    return after
+
+
+def topup(user_id: int, stars_paid: int, detail: str | None = None) -> dict:
+    """The whole of the money-in path. Prices the payment on the ladder from
+    what this person has paid before -- under the wallet's lock, so two
+    payments at once cannot both be priced as somebody's first 500 -- and
+    records the ordinary credit and the bonus as separate ledger rows, with
+    the bonus in a lot of its own that expires.
+
+    Returns stars, credited (ordinary), bonus, balance and bonus_expires."""
+    with _connect() as conn:
+        _lock_wallet_in(conn, user_id)
+        _expire_in(conn, user_id)
+        lifetime = int(conn.execute(
+            f"SELECT lifetime_stars_paid FROM {FAMILY_SCHEMA}.star_balances WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()[0])
+        quote = quote_credit(lifetime, stars_paid)
+        balance = _move_in(conn, user_id, quote["base"], "topup", detail, stars_paid)
+        expires = None
+        if quote["bonus"] > 0:
+            balance = _move_in(conn, user_id, quote["bonus"], "bonus",
+                               f"ladder bonus on {stars_paid} stars, expires in {BONUS_EXPIRY_DAYS} days")
+            expires = conn.execute(
+                f"INSERT INTO {FAMILY_SCHEMA}.star_bonus_lots (user_id, amount, remaining, expires_at) "
+                f"VALUES (%s, %s, %s, now() + make_interval(days => %s)) RETURNING expires_at",
+                (user_id, quote["bonus"], quote["bonus"], BONUS_EXPIRY_DAYS),
+            ).fetchone()[0]
+        conn.commit()
+    return {"stars": stars_paid, "credited": quote["base"], "bonus": quote["bonus"],
+            "balance": balance, "bonus_expires": expires, "lifetime_before": lifetime}
+
+
+def set_star_balance(user_id: int, target: int, reason: str = "adjustment",
+                     detail: str | None = None) -> int:
+    """Put a balance at exactly `target` credits, recording the movement."""
+    with _connect() as conn:
+        before = _lock_wallet_in(conn, user_id)
+        before -= _expire_in(conn, user_id)
+        delta = target - before
+        if delta:
+            conn.execute(
+                f"UPDATE {FAMILY_SCHEMA}.star_balances SET balance = %s, updated_at = now() WHERE user_id = %s",
+                (target, user_id),
+            )
+            _ledger_in(conn, user_id, delta, reason, detail, 0, target)
+            _cap_bonus_in(conn, user_id, target)
+        conn.commit()
+    return target
+
+
+def grant_stars_once(user_id: int, amount: int, key: str, detail: str | None = None,
+                     reason: str = "grant") -> "int | None":
+    """Credit `amount` the first time this (key, user) is ever asked for, and
+    never again. Returns the new balance, or None if it had already been
+    done. The claim is staked atomically in family.settings, and released
+    again if the credit that follows fails."""
+    claim = f"stars:granted:{key}:{user_id}"
+    with _connect() as conn:
+        won = conn.execute(
+            f"INSERT INTO {FAMILY_SCHEMA}.settings (key, value) VALUES (%s, %s) "
+            f"ON CONFLICT (key) DO NOTHING RETURNING key",
+            (claim, datetime.now(timezone.utc).isoformat()),
+        ).fetchone()
+        conn.commit()
+    if not won:
+        return None
+    try:
+        return move_stars(user_id, amount, reason, detail or key)
+    except Exception:
+        try:
+            with _connect() as conn:
+                conn.execute(f"DELETE FROM {FAMILY_SCHEMA}.settings WHERE key = %s", (claim,))
+                conn.commit()
+        except Exception:
+            logger.exception("Could not release the grant claim %s", claim)
+        raise
+
+
+def expire_bonus_credit() -> int:
+    """Housekeeping: expire every person's run-out bonus. Returns how much
+    credit it took in total. Safe from five bots at once -- each wallet is
+    locked, and a lot already cleared is not cleared again."""
+    with _connect() as conn:
+        users = [row[0] for row in conn.execute(
+            f"SELECT DISTINCT user_id FROM {FAMILY_SCHEMA}.star_bonus_lots "
+            f"WHERE remaining > 0 AND expires_at <= now()"
+        ).fetchall()]
+    total = 0
+    for user_id in users:
+        with _connect() as conn:
+            _lock_wallet_in(conn, user_id)
+            total += _expire_in(conn, user_id)
+            conn.commit()
+    return total
+
+
+def star_ledger_for(user_id: int, limit: int = 10) -> list[dict]:
+    """This person's movements, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT occurred_at, bot_id, delta, reason, detail, stars_paid, balance_after "
+            f"FROM {FAMILY_SCHEMA}.star_ledger WHERE user_id = %s "
+            f"ORDER BY id DESC LIMIT %s",
+            (user_id, max(1, min(limit, 100))),
+        ).fetchall()
+    return [{"occurred_at": r[0], "bot_id": r[1], "delta": int(r[2]),
+             "reason": r[3], "detail": r[4], "stars_paid": int(r[5] or 0),
+             "balance_after": int(r[6])}
+            for r in rows]
+
+
+def star_balance_overview(limit: int = 20) -> tuple[dict, list[dict]]:
+    """Family-wide totals, and the largest balances. `outstanding` is credit
+    people hold and have not spent -- work the family still owes -- and
+    `bonus` is the part of it that will expire if unused."""
+    with _connect() as conn:
+        totals = conn.execute(
+            f"SELECT coalesce(sum(balance), 0), coalesce(sum(lifetime_topped_up), 0), "
+            f"coalesce(sum(lifetime_spent), 0), coalesce(sum(lifetime_stars_paid), 0), "
+            f"count(*) FROM {FAMILY_SCHEMA}.star_balances"
+        ).fetchone()
+        bonus = conn.execute(
+            f"SELECT coalesce(sum(remaining), 0) FROM {FAMILY_SCHEMA}.star_bonus_lots "
+            f"WHERE remaining > 0 AND expires_at > now()"
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT user_id, balance, lifetime_topped_up, lifetime_spent, lifetime_stars_paid "
+            f"FROM {FAMILY_SCHEMA}.star_balances "
+            f"WHERE balance <> 0 ORDER BY balance DESC LIMIT %s",
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+    return (
+        {"outstanding": int(totals[0]), "topped_up": int(totals[1]),
+         "spent": int(totals[2]), "stars_paid": int(totals[3]),
+         "wallets": int(totals[4]), "bonus": int(bonus)},
+        [{"user_id": int(r[0]), "balance": int(r[1]), "topped_up": int(r[2]),
+          "spent": int(r[3]), "stars_paid": int(r[4])} for r in rows],
+    )
+
+
+def record_problem_report(code: str, incident: str, occurred_at) -> bool:
+    """Store a problem report. True if it is new, False if this incident was
+    already reported from this bot."""
+    with _connect() as conn:
+        row = conn.execute(
+            f"INSERT INTO {FAMILY_SCHEMA}.problem_reports (bot_id, code, incident, occurred_at, version) "
+            f"VALUES (%s, %s, %s, %s, %s) ON CONFLICT (bot_id, incident) DO NOTHING RETURNING id",
+            (_ledger_bot(), code, incident, occurred_at, VERSION),
+        ).fetchone()
+        conn.commit()
+    return row is not None
+
+
+def recent_problem_reports(limit: int = 15) -> list[dict]:
+    """The latest problem reports, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT reported_at, bot_id, code, incident, occurred_at, version "
+            f"FROM {FAMILY_SCHEMA}.problem_reports ORDER BY id DESC LIMIT %s",
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+    return [{"reported_at": r[0], "bot_id": r[1], "code": r[2], "incident": r[3],
+             "occurred_at": r[4], "version": r[5]} for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +902,7 @@ def bus_is_active() -> bool:
 
 def _monitoring():
     """The module holding this bot's error counter / status text. Called
-    `shared_features` in the four public bots and `monitoring` in ParentBot
+    `shared_features` in the four public bots and `monitoring` in ManagerBot
     (which has no donations or sibling cross-promotion to share) -- looked
     up lazily so this file can stay byte-identical in all five."""
     for name in ("shared_features", "monitoring"):
@@ -370,7 +950,7 @@ def report_event(level: str, kind: str, message: str, details: str | None = None
     """Blocking -- call it through asyncio.to_thread from async code, or
     just let report_event_soon() below do that for you.
 
-    level is one of info / warning / error / critical; ParentBot decides
+    level is one of info / warning / error / critical; ManagerBot decides
     which levels are worth a DM at 3am (see its ALERT_LEVELS)."""
     if not _enabled:
         return
@@ -381,9 +961,9 @@ def report_event(level: str, kind: str, message: str, details: str | None = None
             (_bot_id, level, kind, message[:4000], (details or "")[:8000] or None),
         )
         conn.commit()
-    # ParentBot picks this up on its event pump's next pass -- fast, because a
+    # ManagerBot picks this up on its event pump's next pass -- fast, because a
     # bot reporting an event is usually in the middle of something the bus
-    # cares about, and the pump runs its active cadence whenever ParentBot has
+    # cares about, and the pump runs its active cadence whenever ManagerBot has
     # recently been busy.
 
 
@@ -410,7 +990,7 @@ def record_usage(window_minutes: int, rss_mb, peak_rss_mb, ceiling_mb,
 
 def usage_history(bot_id: str | None = None, hours: int = 24) -> list[dict]:
     """Recent samples, newest first. `bot_id=None` means every bot, which is
-    what ParentBot asks for."""
+    what ManagerBot asks for."""
     if not _enabled:
         return []
     where = "sampled_at > now() - make_interval(hours => %s)"
@@ -453,8 +1033,8 @@ def report_event_soon(level: str, kind: str, message: str, details: str | None =
 # ---------------------------------------------------------------------------
 # Inbound: the command queue
 # ---------------------------------------------------------------------------
-# Each entry returns (text, file_name, file_bytes). Only ParentBot ever puts
-# rows in the queue, and only the owner can drive ParentBot, so these are the
+# Each entry returns (text, file_name, file_bytes). Only ManagerBot ever puts
+# rows in the queue, and only the owner can drive ManagerBot, so these are the
 # same trust level as each bot's own owner-only commands.
 
 def _where_am_i() -> str:
@@ -505,7 +1085,7 @@ def ping_probe() -> dict:
 
 async def _cmd_ping(context, args):
     """Plain `ping` answers a sentence. `ping trace` answers the numbers
-    ParentBot needs to draw the full round trip -- see its /ping."""
+    ManagerBot needs to draw the full round trip -- see its /ping."""
     up = datetime.now(timezone.utc) - _start_time
     if not args or args[0] != "trace":
         return f"pong -- up {_format_delta(up)}", None, None
@@ -575,12 +1155,54 @@ async def _cmd_whois(context, args):
 
 async def _cmd_message(context, args):
     """Sends as THIS bot -- that is the whole point of routing it here
-    rather than having ParentBot send it: the user only ever sees the bot
+    rather than having ManagerBot send it: the user only ever sees the bot
     they actually talked to."""
     if len(args) < 2 or not args[0].lstrip("-").isdigit():
         return "Usage: message <user_id> <text>", None, None
     await context.bot.send_message(chat_id=int(args[0]), text=" ".join(args[1:]))
     return "Sent.", None, None
+
+
+class _RecentLines(logging.Handler):
+    """The last lines one of the log files would hold, kept in memory. A host
+    that writes no log files -- Railway, unless LOG_TO_FILES=1 -- would
+    otherwise give /logs nothing to show: its console output goes to the
+    platform's own viewer, which is not somewhere ManagerBot can reach."""
+
+    def __init__(self, capacity: int, level: int, only: str | None = None):
+        super().__init__(level)
+        self.lines: deque = deque(maxlen=capacity)
+        self.only = only
+
+    def emit(self, record) -> None:
+        if self.only and record.name != self.only:
+            return
+        try:
+            self.lines.extend(self.format(record).splitlines())
+        except Exception:
+            pass
+
+    def tail(self, wanted: int) -> list[str]:
+        return list(self.lines)[-wanted:]
+
+
+_RECENT_LOGS = {
+    "bot.log": _RecentLines(1500, logging.INFO),
+    "errors.log": _RecentLines(800, logging.WARNING),
+    "problems.log": _RecentLines(500, logging.INFO, only="problems"),
+}
+
+
+def keep_recent_log_lines() -> None:
+    """Keep the latest lines of each log in memory, for /logs on a host with
+    no log files. Idempotent; attach() calls it."""
+    root = logging.getLogger()
+    fmt = next((h.formatter for h in root.handlers if h.formatter is not None), None) \
+        or logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    for handler in _RECENT_LOGS.values():
+        if handler not in root.handlers:
+            handler.setFormatter(fmt)
+            root.addHandler(handler)
 
 
 def _tail_lines(path: Path, wanted: int) -> list[str]:
@@ -606,17 +1228,20 @@ async def _cmd_logs(context, args):
     which = "errors.log"
     if args and args[-1] in ("bot", "all"):
         which = "bot.log"
+    elif args and args[-1] in ("problems", "problem"):
+        which = "problems.log"
     path = Path(__file__).resolve().parent / "logs" / which
-    if not path.exists():
-        return (
-            f"No {which} on this host. File logging is off in the cloud by "
-            "default (LOG_TO_FILES=1 turns it back on) -- use the platform's "
-            "own log viewer there.", None, None,
-        )
-    tail = await asyncio.to_thread(_tail_lines, path, lines_wanted)
+    if path.exists():
+        tail = await asyncio.to_thread(_tail_lines, path, lines_wanted)
+        where = which
+    else:
+        # No file on this host (the cloud writes none unless LOG_TO_FILES=1),
+        # so what this process has logged since it started, from memory.
+        tail = _RECENT_LOGS[which].tail(lines_wanted)
+        where = f"{which} (kept in memory since this process started; no log files on this host)"
     if not tail:
-        return f"{which} is empty.", None, None
-    return f"--- {which}, last {len(tail)} line(s) ---\n" + "\n".join(tail), None, None
+        return f"{where}: nothing yet.", None, None
+    return f"--- {where}, last {len(tail)} line(s) ---\n" + "\n".join(tail), None, None
 
 
 async def _cmd_restart(context, args):
@@ -625,7 +1250,7 @@ async def _cmd_restart(context, args):
     Run against a bot started by hand on a laptop it just stops it."""
     async def _bye():
         await asyncio.sleep(2)
-        logger.warning("Restarting: asked to by ParentBot.")
+        logger.warning("Restarting: asked to by ManagerBot.")
         os._exit(1)
 
     asyncio.create_task(_bye())
@@ -634,10 +1259,10 @@ async def _cmd_restart(context, args):
 
 async def _cmd_crashtest(context, args):
     """Deliberately raise inside this bot, so the whole crash path can be
-    checked end to end from ParentBot without waiting for a real bug.
+    checked end to end from ManagerBot without waiting for a real bug.
 
     StickerBot has had a local `/crashtest` for this since v0.4, and it was
-    the one owner-only command with no way to reach it from ParentBot. Now
+    the one owner-only command with no way to reach it from ManagerBot. Now
     every bot has it, which is the more useful shape: what you actually want
     to know is whether the reporting works for the bot that just went quiet,
     and that is never the bot whose chat you happen to be in.
@@ -648,16 +1273,16 @@ async def _cmd_crashtest(context, args):
     reaches the error handler, so it would test nothing. `create_task` routes
     the exception to exactly where a real handler's would go:
     shared_features.error_handler -> record_error -> emit_event -> the alert
-    ParentBot forwards. If that alert does not arrive within a few seconds,
+    ManagerBot forwards. If that alert does not arrive within a few seconds,
     the crash reporting is broken and this is how you found out.
     """
     app = getattr(context, "application", None)
     if app is None:
-        raise RuntimeError("Manual crashtest via ParentBot -- error tracking works.")
+        raise RuntimeError("Manual crashtest via ManagerBot -- error tracking works.")
 
     async def _boom():
         raise RuntimeError(
-            f"Manual crashtest for {_bot_id} via ParentBot -- error tracking works.")
+            f"Manual crashtest for {_bot_id} via ManagerBot -- error tracking works.")
 
     app.create_task(_boom())
     return ("Raised. The alert should arrive in a moment; if it does not, "
@@ -667,14 +1292,14 @@ async def _cmd_crashtest(context, args):
 # ---------------------------------------------------------------------------
 # Talking to everybody, and announcing an update before it lands
 # ---------------------------------------------------------------------------
-# Four commands that all share one shape: ParentBot decides, the bot the user
+# Four commands that all share one shape: ManagerBot decides, the bot the user
 # actually talks to does the speaking. That is the whole reason these live
-# here rather than in ParentBot -- a person who has only ever met StickerBot
+# here rather than in ManagerBot -- a person who has only ever met StickerBot
 # should hear about StickerBot's update from StickerBot, in their own
 # language, and not from a private bot they have never seen.
 
 def _i18n():
-    """This bot's translations, or None. ParentBot has no i18n.py -- it has
+    """This bot's translations, or None. ManagerBot has no i18n.py -- it has
     exactly one reader -- so everything below degrades to plain English
     rather than requiring one."""
     try:
@@ -685,7 +1310,7 @@ def _i18n():
         return None
 
 
-# Fallbacks for ParentBot, and for any key a translation file has not caught
+# Fallbacks for ManagerBot, and for any key a translation file has not caught
 # up with yet. Never the normal path in the four public bots.
 _PLAIN = {
     "update_soon_try_later": "\U0001f527 I'm about to be updated, so I can't start anything new right now. Please try again in about {minutes} minutes.",
@@ -922,7 +1547,7 @@ COMMAND_HELP = {
     "dbdump": "that bot's own tables as a zip of CSVs",
     "whois": "whois <user_id> -- look a user up through that bot",
     "message": "message <user_id> <text> -- DM someone as that bot",
-    "logs": "logs [n] [bot] -- tail errors.log, or bot.log with 'bot'",
+    "logs": "logs [n] [bot|problems] -- tail errors.log, bot.log with 'bot', problems.log with 'problems'",
     "restart": "restart that bot's process",
     "crashtest": "raise on purpose, to check the crash alert still works",
     "broadcast": "broadcast [--active] <text> -- one message as that bot; --active aims it at recent users only",
@@ -986,8 +1611,8 @@ def _finish_command(command_id: int, ok: bool, output: str, file_name, file_byte
             ("done" if ok else "failed", ok, output[:60000], file_name, file_bytes, command_id),
         )
         conn.commit()
-    # ParentBot's result pump collects this on its next pass. That pass is at
-    # the fast cadence: ParentBot marked the bus active when it queued the
+    # ManagerBot's result pump collects this on its next pass. That pass is at
+    # the fast cadence: ManagerBot marked the bus active when it queued the
     # command, so the whole time an answer could be coming back it is looking
     # about once a second.
 
@@ -995,7 +1620,7 @@ def _finish_command(command_id: int, ok: bool, output: str, file_name, file_byte
 async def _run_one_command(context, row) -> None:
     command_id, command, raw_args = row
     handler = COMMANDS.get(command)
-    logger.info("ParentBot asked for: %s %s", command, raw_args)
+    logger.info("ManagerBot asked for: %s %s", command, raw_args)
     try:
         if handler is None:
             ok, output, name, data = False, f"Unknown command '{command}'.", None, None
@@ -1104,6 +1729,10 @@ def _prune_family_rows() -> tuple[int, int]:
 def _prune() -> str:
     commands, events, samples = _prune_family_rows()
     parts = [f"{commands} command(s)", f"{events} event(s)", f"{samples} usage sample(s)"]
+    try:
+        parts.append(f"{expire_bonus_credit()} expired bonus credit")
+    except Exception:
+        logger.debug("Could not expire bonus credit", exc_info=True)
     own = getattr(db, "prune_old_data", None)
     if own is not None:
         parts.append(f"{own()} activity row(s)")
@@ -1132,12 +1761,14 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
     FAMILY_BOT_ID and FAMILY_LABEL override what this process calls itself on
     the bus. They exist for the test bot (see `testbot/`), which runs one of
     the four bots' code on a spare token: without them it would write its
-    heartbeat under the real bot's id, and ParentBot would show a laptop
+    heartbeat under the real bot's id, and ManagerBot would show a laptop
     process as the live one. `testbot/run.ps1` points at a local database as
     well, so this is the second of two locks on the same door rather than the
     only one.
     """
     global _bot_id, _display_name, _start_time, _enabled
+
+    keep_recent_log_lines()
 
     if os.environ.get("FAMILY_BUS", "on").lower() in ("off", "0", "false", "no"):
         logger.info("Family bus disabled (FAMILY_BUS=off) -- running standalone.")
@@ -1153,7 +1784,7 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
     except Exception as exc:
         logger.warning(
             "Family bus unavailable (%s) -- this bot runs fine without it, but "
-            "ParentBot will report it as down until the shared database is reachable.", exc,
+            "ManagerBot will report it as down until the shared database is reachable.", exc,
         )
         return
 
@@ -1178,7 +1809,7 @@ def attach(app, bot_id: str, display_name: str, start_time: datetime) -> None:
     app.job_queue.run_repeating(
         _bus_tick, interval=BUS_POLL_ACTIVE_SECONDS, first=BUS_POLL_ACTIVE_SECONDS
     )
-    # A bot that has just started is usually about to be pinged by ParentBot's
+    # A bot that has just started is usually about to be pinged by ManagerBot's
     # roll-call, so open with the fast cadence rather than making that first
     # command wait a full idle interval.
     mark_bus_active()

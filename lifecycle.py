@@ -25,7 +25,7 @@ one of them is the obvious one:
      their own chat, that an update interrupted them -- once, immediately,
      instead of never.
 
-  4. **The owner gets paged for a deploy they did on purpose.** ParentBot
+  4. **The owner gets paged for a deploy they did on purpose.** ManagerBot
      decides a bot is down from a stale heartbeat, and a redeploy makes
      every heartbeat stale. `mark_expected_restart()` leaves a note in the
      shared database saying this one was deliberate.
@@ -198,7 +198,7 @@ def release_lease() -> None:
 # One table in the bot's own schema (search_path is already pointed there by
 # db.py, so this needs no qualification and cannot collide with a sibling's).
 #
-# JSONB rather than pickle, on purpose. It is readable from ParentBot's /sql,
+# JSONB rather than pickle, on purpose. It is readable from ManagerBot's /sql,
 # it can be pruned by age with plain SQL, and it cannot execute anything on
 # the way back in. The price is that values which are not JSON -- notably
 # whole telegram.Message objects -- are dropped instead of stored; every
@@ -565,10 +565,10 @@ async def _tell_the_interrupted(bot) -> None:
 # ---------------------------------------------------------------------------
 # 4. A deploy is not a crash
 # ---------------------------------------------------------------------------
-# ParentBot calls a bot down when its heartbeat goes stale, which is exactly
+# ManagerBot calls a bot down when its heartbeat goes stale, which is exactly
 # what a redeploy does to it. Leaving a note in the shared settings table
 # lets the watchdog tell "I did this on purpose" from "something is wrong"
-# -- see ParentBot's watchdog.
+# -- see ManagerBot's watchdog.
 
 RESTART_NOTE_PREFIX = "restarting:"
 
@@ -596,7 +596,7 @@ def mark_expected_restart(bot_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Sections 1-4 are about a redeploy nobody was warned about. This one is for
 # the deploy you know is coming: the owner puts a bot into maintenance from
-# ParentBot, and until they say otherwise it declines to *start* anything a
+# ManagerBot, and until they say otherwise it declines to *start* anything a
 # restart would throw away, says roughly how long it expects to be, and
 # writes down who it turned away so they can be told when it is over.
 #
@@ -607,7 +607,7 @@ def mark_expected_restart(bot_id: str) -> None:
 #   startup rather than being held in the process that is about to end.
 #
 #   It has to be free to check. Every incoming message asks "are we paused?",
-#   so the answer is a cached flag -- set at startup and whenever ParentBot
+#   so the answer is a cached flag -- set at startup and whenever ManagerBot
 #   says so -- and not a query per update.
 #
 #   The people turned away have to outlive the process too. That is what
@@ -623,7 +623,7 @@ def mark_expected_restart(bot_id: str) -> None:
 MAINTENANCE_KEY_PREFIX = "maintenance:"
 WAITLIST_TABLE = "update_waitlist"
 
-# What ParentBot's /pause promises when it is not told a number.
+# What ManagerBot's /pause promises when it is not told a number.
 DEFAULT_MAINTENANCE_MINUTES = int(os.environ.get("DEPLOY_MAINTENANCE_MINUTES", "10"))
 
 _maintenance_on = False
@@ -676,7 +676,7 @@ def _read_maintenance(bot_id: str) -> "tuple[bool, datetime | None]":
 def refresh_maintenance(bot_id: str) -> bool:
     """Read the flag out of the shared database into this process. Blocking.
 
-    Called at startup and after ParentBot changes it -- the only two moments
+    Called at startup and after ManagerBot changes it -- the only two moments
     it can have changed, which is why nothing else has to ask.
     """
     global _maintenance_on, _maintenance_until

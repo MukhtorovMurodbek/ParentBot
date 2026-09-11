@@ -1,44 +1,48 @@
-"""ParentBot -- the private one, for the owner only.
+"""ManagerBot -- the private one, for the owner only.
 
 The other four bots in the family each serve the public and each answer to
-their own owner-only commands. ParentBot serves exactly one person and
+their own owner-only commands. ManagerBot serves exactly one person and
 answers for all of them:
 
   * **Watches.** Every bot stamps a heartbeat into the shared database every
-    30 seconds (family_link.py). ParentBot checks those stamps once a minute
+    30 seconds (family_link.py). ManagerBot checks those stamps once a minute
     and messages the owner the moment one goes stale -- and again when it
     comes back. It never repeats itself while a bot stays down.
   * **Reports.** Anything a bot considers worth waking someone for -- an
     unhandled exception, a donation, a restart -- lands in family.events and
-    ParentBot forwards it as a DM within about twenty seconds.
+    ManagerBot forwards it as a DM within about twenty seconds.
   * **Reaches in.** /run <bot> <command> puts a job on the family command
     queue; the target bot runs it in its own process, with its own code and
     its own Telegram identity, and the answer comes back here. That is how
     /dbdump, /whois, /message and the rest work against a bot deployed on a
-    machine ParentBot cannot otherwise reach.
+    machine ManagerBot cannot otherwise reach.
   * **Reads across.** One shared Postgres database with a schema per bot
     means "how many people used ConvertBot this week" is a single query, no
     matter whether ConvertBot itself is even running.
 
-Nothing here is reachable by anyone but the ids in PBOT_ADMIN_ID. A stranger
+Nothing here is reachable by anyone but the ids in MBOT_ADMIN_ID. A stranger
 who finds this bot gets one flat sentence and nothing else -- and the owner
 gets told they turned up.
 
-Env vars: PBOT_TOKEN, PBOT_USERNAME (no @), PBOT_ADMIN_ID (required -- with
+Env vars: MBOT_TOKEN, MBOT_USERNAME (no @), MBOT_ADMIN_ID (required -- with
 it empty the bot refuses to start rather than run wide open), DATABASE_URL
-(the shared family database), DB_SCHEMA (default "parent_bot").
+(the shared family database), DB_SCHEMA (default "manager_bot").
 """
 import asyncio
+import hashlib
 import html
 import json
 import logging
 import os
 import re
+import tempfile
 import time as time_module
+import zipfile
 from collections import OrderedDict
 from itertools import takewhile
 from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 
 try:  # optional convenience: load the .env sitting next to this file
     from dotenv import load_dotenv
@@ -64,6 +68,7 @@ from telegram.ext import (
 import db
 import family_link
 import lifecycle
+import problems
 from live_message import LiveMessage, edit_in_place
 from db import init_db
 from monitoring import (
@@ -81,34 +86,34 @@ logger = logging.getLogger(__name__)
 
 START_TIME = datetime.now(timezone.utc)
 
-BOT_TOKEN = os.environ.get("PBOT_TOKEN")
-BOT_USERNAME = os.environ.get("PBOT_USERNAME")  # no @
-BOT_NAME = "parentbot"
-DISPLAY_NAME = "ParentBot"
+BOT_TOKEN = os.environ.get("MBOT_TOKEN")
+BOT_USERNAME = os.environ.get("MBOT_USERNAME")  # no @
+BOT_NAME = "managerbot"
+DISPLAY_NAME = "ManagerBot"
 
-ADMIN_IDS = {int(x) for x in os.environ.get("PBOT_ADMIN_ID", "").split(",") if x.strip()}
+ADMIN_IDS = {int(x) for x in os.environ.get("MBOT_ADMIN_ID", "").split(",") if x.strip()}
 
 # A bot is "down" once its heartbeat is this stale. family_link beats every
 # 30s by default, so this is four missed beats -- long enough not to page
 # anyone over one slow database round-trip, short enough to catch a crash
 # loop before it has been down for an hour.
-DOWN_AFTER_SECONDS = int(os.environ.get("PBOT_DOWN_AFTER_SECONDS", "120"))
+DOWN_AFTER_SECONDS = int(os.environ.get("MBOT_DOWN_AFTER_SECONDS", "120"))
 
-# How long a queued command waits for its target before ParentBot gives up
+# How long a queued command waits for its target before ManagerBot gives up
 # and says so.
-COMMAND_TIMEOUT_SECONDS = int(os.environ.get("PBOT_COMMAND_TIMEOUT_SECONDS", "90"))
+COMMAND_TIMEOUT_SECONDS = int(os.environ.get("MBOT_COMMAND_TIMEOUT_SECONDS", "90"))
 
-# How ParentBot collects command results and child-bot events: the same
+# How ManagerBot collects command results and child-bot events: the same
 # adaptive poll the child bots use for the command queue (family_link._bus_tick).
 # One fast tick decides each time whether to sweep -- every FAST interval while
-# the bus is active (family_link.bus_is_active(), which ParentBot sets the
+# the bus is active (family_link.bus_is_active(), which ManagerBot sets the
 # moment it queues a command), every SLOW interval once it has gone quiet.
-RESULT_POLL_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_SECONDS", "20"))
-EVENT_POLL_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_SECONDS", "30"))
-RESULT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_RESULT_POLL_FAST_SECONDS", "1"))
-EVENT_POLL_FAST_SECONDS = int(os.environ.get("PBOT_EVENT_POLL_FAST_SECONDS", "2"))
+RESULT_POLL_SECONDS = int(os.environ.get("MBOT_RESULT_POLL_SECONDS", "20"))
+EVENT_POLL_SECONDS = int(os.environ.get("MBOT_EVENT_POLL_SECONDS", "30"))
+RESULT_POLL_FAST_SECONDS = int(os.environ.get("MBOT_RESULT_POLL_FAST_SECONDS", "1"))
+EVENT_POLL_FAST_SECONDS = int(os.environ.get("MBOT_EVENT_POLL_FAST_SECONDS", "2"))
 # How often the pumps tick to make that decision.
-PUMP_TICK_SECONDS = int(os.environ.get("PBOT_PUMP_TICK_SECONDS", "1"))
+PUMP_TICK_SECONDS = int(os.environ.get("MBOT_PUMP_TICK_SECONDS", "1"))
 
 # A redeploy makes a bot's heartbeat stale exactly the way a crash does, and
 # for the first minute of it there is no way to tell them apart from the
@@ -118,7 +123,7 @@ PUMP_TICK_SECONDS = int(os.environ.get("PBOT_PUMP_TICK_SECONDS", "1"))
 # redeploy rather than as a failure. If it is still missing when the note has
 # gone stale, the ordinary "it is down" alert fires after all -- a deploy
 # that never came back is exactly the thing worth being told about.
-REDEPLOY_GRACE_SECONDS = int(os.environ.get("PBOT_REDEPLOY_GRACE_SECONDS", "300"))
+REDEPLOY_GRACE_SECONDS = int(os.environ.get("MBOT_REDEPLOY_GRACE_SECONDS", "300"))
 
 # How long the startup roll-call waits before reporting who is up. The point
 # of the delay is to send one message instead of five: the other four write
@@ -126,12 +131,12 @@ REDEPLOY_GRACE_SECONDS = int(os.environ.get("PBOT_REDEPLOY_GRACE_SECONDS", "300"
 # they start polling -- so a few seconds is all it takes for a family started
 # together to be fully visible. start_all.ps1 already gives them the same head
 # start, for the same reason. Set to 0 to report immediately.
-STARTUP_ROLLCALL_SECONDS = int(os.environ.get("PBOT_ROLLCALL_SECONDS", "5"))
+STARTUP_ROLLCALL_SECONDS = int(os.environ.get("MBOT_ROLLCALL_SECONDS", "5"))
 
 # A bot whose heartbeat is younger than this at roll-call time came up with
 # this batch rather than having been running already. Affects the wording of
 # one line, nothing else.
-ROLLCALL_FRESH_SECONDS = int(os.environ.get("PBOT_ROLLCALL_FRESH_SECONDS", "120"))
+ROLLCALL_FRESH_SECONDS = int(os.environ.get("MBOT_ROLLCALL_FRESH_SECONDS", "120"))
 
 # Which event levels are worth an unprompted DM. Everything is still
 # recorded either way -- /events shows the rest.
@@ -140,7 +145,7 @@ ALERT_LEVELS = {"warning", "error", "critical"}
 # "HH:MM" in UTC for a once-a-day summary, or empty for none (the default --
 # down/up transitions and crashes already arrive on their own, and a daily
 # "all fine" message is the kind of thing you stop reading).
-DIGEST_AT_UTC = os.environ.get("PBOT_DIGEST_UTC", "").strip()
+DIGEST_AT_UTC = os.environ.get("MBOT_DIGEST_UTC", "").strip()
 
 TELEGRAM_MAX_CHARS = 3900  # a little under the real 4096, leaving room for markup
 
@@ -182,7 +187,7 @@ ALL_BOTS = CHILDREN + [{"id": BOT_NAME, "name": DISPLAY_NAME, "schema": db.DB_SC
 #
 # Every layer of this project derives from one canonical id -- see the naming
 # table in ARCHITECTURE.md -- with exactly one exception: the Telegram
-# @username. Two of those were chosen before the family names settled and
+# @username. One of those was chosen before the family names settled and
 # cannot simply be brought into line, because a username is not a label but
 # an address:
 #
@@ -192,20 +197,25 @@ ALL_BOTS = CHILDREN + [{"id": BOT_NAME, "name": DISPLAY_NAME, "schema": db.DB_SC
 #   redirect and no way to find the people holding them. That username is
 #   frozen for as long as the bot has users.
 #
-#   ParentBot is @mumu_manager_bot, which is only an inconsistency -- it is
-#   private, it has one user, and nobody has a saved link to it. That one is
-#   safe to change in @BotFather whenever it is convenient, and DEPLOY.md
-#   says so.
-#
 # So rather than pretend the mismatch is not there, it is written down here
 # and every form resolves. `/logs chat`, `/logs anon`, `/logs anonbot` and
 # `/logs @mumu_chat_bot` all reach the same bot.
+#
+# This bot used to be the second exception. It was ManagerBot's predecessor
+# ParentBot at @mumu_manager_bot, and the plan was to move the username to
+# @mumu_parent_bot. v1.6.0 did the opposite -- the name followed the address
+# rather than the address following the name -- because the username was the
+# only layer with anything depending on it and the other six were free. So
+# there is one exception left in the family rather than two.
+#
+# `parent` and `parentbot` stay as aliases. They are what the owner has been
+# typing for months, and an alias costs a list entry.
 USERNAME_ALIASES = {
     "stickerbot": ["mumu_sticker_bot"],
     "convertbot": ["mumu_convert_bot"],
     "downloaderbot": ["mumu_downloader_bot"],
     "anonbot": ["mumu_chat_bot", "chat", "chatbot"],
-    "parentbot": ["mumu_manager_bot", "manager", "managerbot"],
+    "managerbot": ["mumu_manager_bot", "manager", "parent", "parentbot"],
 }
 
 
@@ -252,15 +262,11 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return True
     if user and user.id not in _reported_strangers:
         _reported_strangers.add(user.id)
-        handle = f" (@{user.username})" if user.username else ""
-        await notify_owner(
-            context,
-            f"👀 A stranger found ParentBot: <code>{user.id}</code>{html.escape(handle)} "
-            f"— {html.escape(user.full_name or '?')}. They were turned away.",
-        )
+        # That somebody found it, not who: no user details go to the owner.
+        await notify_owner(context, "👀 A stranger found ManagerBot, and was turned away.")
         await asyncio.to_thread(
             db.log_event, BOT_NAME, "warning", "stranger",
-            f"Unknown user {user.id}{handle} messaged ParentBot.",
+            "An unknown user messaged ManagerBot.",
         )
     if update.message:
         await update.message.reply_text("This is a private bot.")
@@ -375,7 +381,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.message.reply_text(
             f"⚠️ Couldn't read the family database: {exc}\n\n"
-            "Every bot may well be fine -- this is ParentBot's own connection failing."
+            "Every bot may well be fine -- this is ManagerBot's own connection failing."
         )
         return
     await update.message.reply_text(board, parse_mode=ParseMode.HTML, reply_markup=_board_keyboard())
@@ -566,7 +572,7 @@ async def board_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # in the chat instead.
         await query.message.reply_text(
             f"⚠️ Couldn't read the family database: {exc}\n\n"
-            "Every bot may well be fine -- this is ParentBot's own connection failing."
+            "Every bot may well be fine -- this is ManagerBot's own connection failing."
         )
         return
     # live_message rather than edit_text: it swallows "message is not
@@ -578,7 +584,7 @@ async def board_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ParentBot's own /status, in the same shape every other bot uses."""
+    """ManagerBot's own /status, in the same shape every other bot uses."""
     if not await guard(update, context):
         return
     now = datetime.now(timezone.utc)
@@ -599,14 +605,14 @@ async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # unknown family command with "Unknown command" rather than failing. That is
 # the right behaviour and it stays.
 #
-# What it is not is a good explanation. ParentBot is always the first thing
+# What it is not is a good explanation. ManagerBot is always the first thing
 # to ship (it is private, so it costs nobody anything), which means it is
 # routinely a version or two ahead of the bots it is asking. Typing
 # /providers and being told "Unknown command 'providers'" says the bot is
 # broken; the truth is that DownloaderBot has not been published since the
 # command was written.
 #
-# ParentBot already knows every bot's version -- it is in the heartbeat and
+# ManagerBot already knows every bot's version -- it is in the heartbeat and
 # on the /status board. So it can say which it is, before the round trip.
 # Anything not listed here has been in the family since before the versions
 # were tracked, and is never blocked.
@@ -643,7 +649,7 @@ def _version_key(version: str | None):
 # command is refused, while an unknown flag is just part of the message. A
 # 1.2.x bot handed `broadcast --active hello` would send every user it has
 # ever seen a message beginning "--active".
-FLAG_SINCE = {("broadcast", "--active"): "1.3.0"}
+FLAG_SINCE = {("broadcast", "--active"): "1.3.0", ("logs", "problems"): "1.6.0"}
 
 
 def _too_old_for(bot_version: str | None, command: str, args: list[str] | None = None) -> str | None:
@@ -668,13 +674,13 @@ def _too_old_for(bot_version: str | None, command: str, args: list[str] | None =
 async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     bot: dict, command: str, args: list[str]) -> None:
     if bot["id"] == BOT_NAME:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "That one is me. Use /status, /me, /events or /backup directly."
         )
         return
     if command not in family_link.COMMANDS:
         known = ", ".join(sorted(family_link.COMMANDS))
-        await update.message.reply_text(f"{bot['name']} has no '{command}'. Try: {known}")
+        await update.effective_message.reply_text(f"{bot['name']} has no '{command}'. Try: {known}")
         return
 
     # Asked before the round trip rather than after it, so a version gap
@@ -682,7 +688,7 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE,
     beat = await asyncio.to_thread(db.heartbeat_of, bot["id"])
     stale = _too_old_for((beat or {}).get("version"), command, args)
     if stale:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"⏳ <b>{html.escape(bot['name'])}</b> · {html.escape(command)}\n\n"
             + stale.replace("{dir}", bot["schema"]),
             parse_mode=ParseMode.HTML,
@@ -699,7 +705,7 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # contradicting itself. N is the row id of the queued command, which is
     # only ever useful for matching this line to the timeout notice that
     # quotes the same id.
-    await update.message.reply_text(f"→ {bot['name']} · {command} — queued as #{command_id}")
+    await update.effective_message.reply_text(f"→ {bot['name']} · {command} — queued as #{command_id}")
 
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -755,6 +761,62 @@ def _shortcut(command: str, min_args: int, usage: str, default_bot: str | None =
             return
         await _dispatch(update, context, bot, command, args)
     return handler
+
+
+# ---------------------------------------------------------------------------
+# /errorlog, /botlog, /problemlog -- the logs, without remembering how
+# ---------------------------------------------------------------------------
+# The owner asked for "easier commands to see the logs". /logs <bot> [n]
+# [bot|problems] reads all three, but only for somebody who remembers the file
+# names and the bot names. These carry the file in the command's name, and with
+# no bot named they answer with a button per bot instead of a usage line.
+# Typing the bot still works: /problemlog conv 100.
+
+LOG_FILES = {"errorlog": "errors", "botlog": "bot", "problemlog": "problems"}
+LOG_TITLES = {"errorlog": "errors.log", "botlog": "bot.log", "problemlog": "problems.log"}
+
+
+def _log_picker(kind: str, lines: str = "") -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(b["name"], callback_data=f"logpick:{kind}:{b['id']}:{lines}")
+               for b in ALL_BOTS if b["id"] != BOT_NAME]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+
+def _log_shortcut(kind: str):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await guard(update, context):
+            return
+        args = list(context.args)
+        named = [a for a in args if not a.isdigit()]
+        lines = next((a for a in args if a.isdigit()), "")
+        target = resolve_bot(named[0]) if named else None
+        if named and target is None:
+            await update.message.reply_text(f"No such bot: {named[0]}. Known: {bot_list_hint()}")
+            return
+        if target is None:
+            await update.message.reply_text(f"Whose {LOG_TITLES[kind]}?",
+                                            reply_markup=_log_picker(kind, lines))
+            return
+        await _dispatch(update, context, target, "logs", ([lines] if lines else []) + [LOG_FILES[kind]])
+    return handler
+
+
+async def log_pick_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A bot tapped under /errorlog, /botlog or /problemlog. The buttons stay,
+    so another bot's log is one more tap."""
+    query = update.callback_query
+    if not await guard(update, context):
+        await query.answer()
+        return
+    parts = (query.data or "").split(":")
+    kind = parts[1] if len(parts) > 1 else ""
+    target = resolve_bot(parts[2]) if len(parts) > 2 else None
+    lines = parts[3] if len(parts) > 3 and parts[3].isdigit() else ""
+    if kind not in LOG_FILES or target is None:
+        await query.answer("That button no longer works.", show_alert=True)
+        return
+    await query.answer()
+    await _dispatch(update, context, target, "logs", ([lines] if lines else []) + [LOG_FILES[kind]])
 
 
 # ---------------------------------------------------------------------------
@@ -840,17 +902,17 @@ def _render_ping(trace: dict, result: dict) -> str:
         pass
 
     lines = [
-        _row("you → Telegram → ParentBot", _ms(trace["to_parent"]) + "   ±1 s"),
-        _row("ParentBot → Telegram (ack)", _ms(trace["ack_ms"])),
-        _row("ParentBot → Supabase (queue)", _ms(trace["queue_ms"])),
+        _row("you → Telegram → ManagerBot", _ms(trace["to_manager"]) + "   ±1 s"),
+        _row("ManagerBot → Telegram (ack)", _ms(trace["ack_ms"])),
+        _row("ManagerBot → Supabase (queue)", _ms(trace["queue_ms"])),
         _row(f"queued → {name} claimed it", _ms(claimed - created)),
         _row(f"{name} answering", _ms(finished - claimed)),
-        _row("answer → ParentBot collected it", _ms(taken - finished)),
+        _row("answer → ManagerBot collected it", _ms(taken - finished)),
         "─" * 40,
         _row("bus round trip", _ms(taken - created)),
     ]
 
-    # Named for what it is. This is the admin bus -- ParentBot handing a
+    # Named for what it is. This is the admin bus -- ManagerBot handing a
     # command to another bot through a Postgres table and waiting for the
     # answer to come back. It is not what a user waits for: their message goes
     # to the bot they are talking to directly and never touches this path. The
@@ -858,7 +920,7 @@ def _render_ping(trace: dict, result: dict) -> str:
     head = (f"🏓 <b>{html.escape(name)}</b> — {_ms(taken - created).strip()} "
             f"round trip on the admin bus")
     ends = "\n\n".join([
-        _describe_end("ParentBot", trace["here"].get("where", "?"), trace["here"]),
+        _describe_end("ManagerBot", trace["here"].get("where", "?"), trace["here"]),
         _describe_end(name, there.get("where", "?"), there),
     ])
     up = there.get("up")
@@ -890,7 +952,7 @@ async def _ping_one(update: Update, context: ContextTypes.DEFAULT_TYPE, bot: dic
 
     _remember_trace(command_id, {
         "bot": bot, "live": live, "here": here,
-        "to_parent": now - update.message.date,
+        "to_manager": now - update.message.date,
         "ack_ms": ack_ms, "queue_ms": queue_ms,
     })
 
@@ -932,7 +994,7 @@ async def broadcast_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         _remember_trace(command_id, {
             "bot": child, "group": group, "here": here,
-            "to_parent": now - update.message.date, "ack_ms": ack_ms,
+            "to_manager": now - update.message.date, "ack_ms": ack_ms,
             "queue_ms": (time_module.perf_counter() - queue_started) * 1000,
         })
 
@@ -1087,6 +1149,175 @@ async def donations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Credit balances
+# ---------------------------------------------------------------------------
+# The family charges in credits and holds a balance per person, in
+# family.star_balances (see family_link.py, which owns the arithmetic). Before
+# this the only way to look at one was Supabase's table editor and the only
+# way to change one was a hand-written UPDATE -- which is the sort of thing
+# that goes wrong at 2 a.m. and leaves no record of who did it.
+#
+# Everything here goes through family_link, so an owner adjusting a balance
+# writes the same kind of ledger row a top-up does and the history stays
+# readable. There is no "just set the number" path that skips the ledger.
+
+def _parse_balance_change(arg: str):
+    """`+100`, `-50` or `=0` -> ("add"/"set", amount). None if it is not one.
+
+    Deliberately three explicit forms rather than a bare number. A bare
+    number is ambiguous in the one direction that matters -- `/balance 12345
+    500` could plausibly mean "give them 500" or "make it 500" -- and the two
+    differ by however much they already had.
+    """
+    if len(arg) < 2 or arg[0] not in "+-=":
+        return None
+    try:
+        amount = int(arg[1:])
+    except ValueError:
+        return None
+    if arg[0] == "=":
+        return ("set", amount)
+    return ("add", amount if arg[0] == "+" else -amount)
+
+
+def _ledger_lines(rows) -> list:
+    out = []
+    for row in rows:
+        when = row["occurred_at"].strftime("%Y-%m-%d %H:%M")
+        sign = "+" if row["delta"] > 0 else ""
+        paid = f", {row['stars_paid']} ⭐ paid" if row["stars_paid"] else ""
+        detail = f" — {html.escape(str(row['detail']))}" if row["detail"] else ""
+        out.append(f"  {when}  {sign}{row['delta']} ⚡ → {row['balance_after']} ⚡"
+                   f"  [{row['reason']} via {row['bot_id']}{paid}]{detail}")
+    return out
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/balance                -- the family-wide picture
+       /balance <user_id>      -- one person, with their last movements
+       /balance <user_id> +100 -- give them 100 credits
+       /balance <user_id> -100 -- take 100 away (may go negative)
+       /balance <user_id> =0   -- set it to exactly 0
+    """
+    if not await guard(update, context):
+        return
+    args = context.args or []
+
+    if not args:
+        totals, rows = await asyncio.to_thread(family_link.star_balance_overview, 20)
+        lines = [
+            "⚡ Credit balances, whole family",
+            "",
+            f"  Outstanding: {totals['outstanding']} ⚡ across {totals['wallets']} wallet(s)",
+            f"  Ever credited: {totals['topped_up']} ⚡   ever spent: {totals['spent']} ⚡",
+            f"  Real money behind it: {totals['stars_paid']} ⭐",
+            f"  Bonus credit still unspent (expires if unused): {totals['bonus']} ⚡",
+            f"  Rate: 1 ⭐ = {family_link.credit_for_stars(1)} ⚡ · ladder: "
+            + (", ".join(f"next {size} ⭐ at {mult:g}x" for size, mult in family_link.TOPUP_LADDER) or "off")
+            + f" · bonus expires after {family_link.BONUS_EXPIRY_DAYS} days",
+        ]
+        if rows:
+            lines += ["", "Largest balances:"]
+            for row in rows:
+                lines.append(f"  <code>{row['user_id']}</code>  {row['balance']} ⚡"
+                             f"  (in {row['topped_up']}, out {row['spent']},"
+                             f" paid {row['stars_paid']} ⭐)")
+        else:
+            lines += ["", "  Nobody holds any credit yet."]
+        lines += ["", "One person: /balance &lt;user_id&gt; · "
+                      "change it: /balance &lt;user_id&gt; +100"]
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if not args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "Usage: /balance [user_id] [+100 | -100 | =0]\n"
+            "A numeric Telegram user id — /whois &lt;bot&gt; &lt;id&gt; if you need "
+            "to check who it is.",
+            parse_mode=ParseMode.HTML)
+        return
+    user_id = int(args[0])
+
+    if len(args) > 1:
+        change = _parse_balance_change(args[1])
+        if change is None:
+            await update.message.reply_text(
+                f"Didn't understand <code>{html.escape(args[1])}</code>. Use +100 to add, "
+                "-100 to take away, or =100 to set it exactly.",
+                parse_mode=ParseMode.HTML)
+            return
+        kind, amount = change
+        who = update.effective_user
+        detail = f"by admin {who.id}" + (f" (@{who.username})" if who.username else "")
+        if kind == "set":
+            after = await asyncio.to_thread(
+                family_link.set_star_balance, user_id, amount, "adjustment", detail)
+            what = f"set to {after} ⚡"
+        else:
+            after = await asyncio.to_thread(
+                family_link.move_stars, user_id, amount, "adjustment", detail)
+            what = f"{'+' if amount > 0 else ''}{amount} ⚡ → {after} ⚡"
+        # Into the family log too, so a change shows up in /events beside
+        # everything else that happened tonight.
+        await asyncio.to_thread(
+            family_link.report_event, "info", "payment",
+            f"Balance of {user_id} {what} by admin {who.id}")
+        await update.message.reply_text(
+            f"⚡ <code>{user_id}</code>: {what}", parse_mode=ParseMode.HTML)
+
+    totals = await asyncio.to_thread(family_link.star_totals, user_id)
+    rows = await asyncio.to_thread(family_link.star_ledger_for, user_id, 12)
+    lines = [
+        f"⚡ <code>{user_id}</code>",
+        "",
+        f"  Balance: {totals['balance']} ⚡",
+        f"  Credited over time: {totals['topped_up']} ⚡   spent: {totals['spent']} ⚡",
+        f"  Actually paid: {totals['stars_paid']} ⭐",
+        f"  Bonus credit: {totals['bonus']} ⚡"
+        + (f", next {totals['bonus_next_amount']} ⚡ expires {totals['bonus_next_expiry']:%Y-%m-%d}"
+           if totals["bonus"] else ""),
+    ]
+    if rows:
+        lines += ["", "Last movements:"] + _ledger_lines(rows)
+    else:
+        lines += ["", "  No movements recorded."]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def addcredit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addcredit <user_id> <amount> -- put ⚡ into anybody's balance by id.
+
+    The owner's answer to "give my account 10k": not a seed that runs on its
+    own, but a lever to pull for any account, on purpose, with a record. It
+    is /balance <id> +N under a name nobody has to remember the syntax of.
+
+    Recorded as a grant rather than a bonus, so it never expires, and in the
+    family log so it shows up in /events beside everything else.
+    """
+    if not await guard(update, context):
+        return
+    args = context.args or []
+    amount_text = args[1].lstrip("+") if len(args) == 2 else ""
+    if len(args) != 2 or not args[0].isdigit() or not amount_text.isdigit() or int(amount_text) <= 0:
+        await update.message.reply_text(
+            "Usage: /addcredit &lt;user_id&gt; &lt;amount&gt;\n"
+            "Adds that many ⚡ to the account. It does not expire. "
+            "To take credit away or set an exact number, use /balance.",
+            parse_mode=ParseMode.HTML)
+        return
+    user_id, amount = int(args[0]), int(amount_text)
+    who = update.effective_user
+    detail = f"added by admin {who.id}" + (f" (@{who.username})" if who.username else "")
+    after = await asyncio.to_thread(family_link.move_stars, user_id, amount, "grant", detail)
+    await asyncio.to_thread(
+        family_link.report_event, "info", "payment",
+        f"+{amount} credit added to {user_id} by admin {who.id}, balance {after}")
+    await update.message.reply_text(
+        f"⚡ +{amount} added to <code>{user_id}</code>. Balance now {after} ⚡.",
+        parse_mode=ParseMode.HTML)
+
+
 async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
@@ -1145,28 +1376,164 @@ async def sql_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Backups
 # ---------------------------------------------------------------------------
 
+# What one document may be. The cloud Bot API refuses a bot's upload over
+# 50 MB, and the multipart request around the file costs a little of that.
+BACKUP_PART_BYTES = int(os.environ.get("MBOT_BACKUP_PART_MB") or 49) * 1024 * 1024
+
+
+def _backup_parts(size: int, limit: "int | None" = None) -> list:
+    """(start, end) byte ranges of at most `limit` bytes, covering `size`."""
+    limit = limit or BACKUP_PART_BYTES
+    if size <= limit:
+        return [(0, size)]
+    return [(start, min(start + limit, size)) for start in range(0, size, limit)]
+
+
+def _build_backup(out_path: Path) -> dict:
+    """family_db.backup into `out_path`, and what the caption says about it.
+
+    Imported here rather than at the top: family_db is a command-line tool
+    that happens to live in this folder, and nothing else in the bot needs
+    it loaded."""
+    import family_db
+    try:
+        family_db.backup(db.DATABASE_URL, out_path, None)
+    except SystemExit as exc:
+        # Its command-line way of saying "no tables at all".
+        raise RuntimeError(str(exc) or "nothing to back up") from None
+    with zipfile.ZipFile(out_path) as archive:
+        manifest = json.loads(archive.read("MANIFEST.json"))
+    digest = hashlib.sha256()
+    with open(out_path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    tables = manifest.get("tables") or []
+    return {"tables": len(tables), "rows": sum(t.get("approx_rows", 0) for t in tables),
+            "size": out_path.stat().st_size, "sha256": digest.hexdigest()}
+
+
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The whole shared database -- every bot's schema, one folder each --
-    as a single zip of CSVs. Built through the ordinary psycopg connection,
-    so it needs no pg_dump anywhere and works identically against the
-    laptop's Postgres and Railway's. For a restorable, full-fidelity copy
-    (indexes, sequences, types) use db_backup.ps1 at the repo root."""
+    """The whole shared database, every schema, as the archive family_db.py
+    restores from -- sent here, and pinned.
+
+    Lossless: each table is Postgres's own COPY into CSV, so binary columns,
+    NULLs, timestamps and JSON come back exactly, compressed with DEFLATE and
+    nothing thrown away. MANIFEST.json names every table's columns, which is
+    what lets a restore line up against a database that has gained columns
+    since. It replaces the old zip, which summarised binary columns and could
+    be read but not restored from.
+
+    Redeploying from it: start each bot once against the new database so the
+    tables exist, then
+        python manager_bot/family_db.py restore --into <url> --file <zip> --mode replace
+    DEPLOY.md, "Restoring from a pinned backup", has the whole of it.
+
+    Pinned with no notification, and nothing in this bot ever unpins -- so
+    every backup stays one tap away at the top of this chat, the newest and
+    all the ones before it. tests/test_backup.py holds that to the source.
+    Over BACKUP_PART_BYTES it goes as numbered parts, each pinned, joined
+    back with `copy /b` or `cat`.
+    """
     if not await guard(update, context):
         return
-    note = await update.message.reply_text("Exporting the whole family database…")
-    schemas = [b["schema"] for b in ALL_BOTS] + ["family"]
-    try:
-        data = await asyncio.to_thread(db.dump_family_csv_zip, schemas)
-    except Exception as exc:
-        await edit_in_place(note, context.bot, f"⚠️ Export failed: {exc}")
-        return
+    chat_id = update.effective_chat.id
+    note = await update.message.reply_text("Backing up the whole database…")
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
-    await update.message.reply_document(
-        document=BytesIO(data),
-        filename=f"botfamily_{stamp}.zip",
-        caption=f"{len(data)/1024:.0f} KB · {len(schemas)} schema(s)",
-    )
-    await note.delete()
+    name = f"botfamily_{stamp}.zip"
+    with tempfile.TemporaryDirectory(prefix="mbot-backup-") as folder:
+        path = Path(folder) / name
+        try:
+            info = await asyncio.to_thread(_build_backup, path)
+        except Exception as exc:
+            logger.exception("Backup failed")
+            await edit_in_place(note, context.bot, f"⚠️ Backup failed: {type(exc).__name__}: {exc}")
+            return
+
+        parts = _backup_parts(info["size"])
+        summary = (f"{info['size'] / (1024 * 1024):.1f} MB · {info['tables']} tables · "
+                   f"~{info['rows']} rows\nsha256 {info['sha256']}")
+        pinned = 0
+        for index, (start, end) in enumerate(parts, 1):
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                chunk = handle.read(end - start)
+            if len(parts) == 1:
+                filename = name
+                caption = "🗄 Database backup — lossless, restorable\n" + summary
+            else:
+                filename = f"{name}.{index:03d}"
+                caption = (f"🗄 Database backup — part {index} of {len(parts)}\n"
+                           + summary + "\n(the checksum is of the joined file)")
+            try:
+                sent = await context.bot.send_document(
+                    chat_id=chat_id, document=BytesIO(chunk), filename=filename,
+                    caption=caption, read_timeout=300, write_timeout=300)
+            except Exception as exc:
+                logger.exception("Could not send backup part %s", index)
+                await edit_in_place(note, context.bot,
+                                    f"⚠️ The backup was made but part {index} of {len(parts)} "
+                                    f"could not be sent: {type(exc).__name__}: {exc}")
+                return
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+                pinned += 1
+            except Exception:
+                logger.warning("Could not pin backup part %s", index, exc_info=True)
+
+    lines = [f"✅ Backed up and pinned ({pinned} of {len(parts)} pinned)." if pinned < len(parts)
+             else ("✅ Backed up and pinned." if len(parts) == 1
+                   else f"✅ Backed up in {len(parts)} parts, all pinned.")]
+    if len(parts) > 1:
+        lines.append(f"Join them first: <code>copy /b {name}.001+{name}.002 {name}</code> "
+                     f"on Windows, or <code>cat {name}.0* &gt; {name}</code>.")
+    lines.append("To restore: start each bot once against the new database, then "
+                 "<code>python manager_bot/family_db.py restore --into &lt;url&gt; "
+                 f"--file {name} --mode replace</code>. DEPLOY.md has the details.")
+    await edit_in_place(note, context.bot, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# Problem reports
+# ---------------------------------------------------------------------------
+
+async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reports [n] -- the latest problem reports people sent from the public
+    bots. Each is also messaged to FAMILY_REPORTS_TO as it arrives; this is
+    the list, for when one was missed."""
+    if not await guard(update, context):
+        return
+    limit = int(context.args[0]) if context.args and context.args[0].isdigit() else 15
+    rows = await asyncio.to_thread(family_link.recent_problem_reports, max(1, min(limit, 50)))
+    if not rows:
+        await update.message.reply_text("No problem reports yet.")
+        return
+    lines = ["🐞 Latest problem reports", ""]
+    for row in rows:
+        problem = problems.PROBLEMS.get(row["code"])
+        lines.append(f"{row['reported_at']:%Y-%m-%d %H:%M} · {row['bot_id']} · {row['code']} "
+                     f"({row['incident']}) — {problem.title if problem else 'unknown code'}")
+    lines += ["", "What a code means: /decode <code>"]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def decode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/decode <code> -- what an error code means, from problems.py, the same
+    registry the public bots code their messages from. Any unambiguous part of
+    a code works: /decode reddit."""
+    if not await guard(update, context):
+        return
+    wanted = " ".join(context.args or []).replace("🆔", "").strip().upper()
+    if not wanted:
+        await update.message.reply_text("Usage: /decode <code> — for example /decode CV-TIMEOUT")
+        return
+    matches = [wanted] if wanted in problems.PROBLEMS else [c for c in problems.PROBLEMS if wanted in c]
+    if len(matches) == 1:
+        await update.message.reply_text(problems.decode(matches[0]))
+    elif matches:
+        await update.message.reply_text("More than one code matches: " + ", ".join(matches[:40]))
+    else:
+        await update.message.reply_text(f"No code matches {wanted}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1200,12 +1567,12 @@ async def _alerts_on() -> bool:
 
 
 async def startup_rollcall(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """One message, once, a few seconds after ParentBot starts: who is up.
+    """One message, once, a few seconds after ManagerBot starts: who is up.
 
     This answers "I just started the family, did it work?" -- a question that
     previously had no answer except typing /status yourself. The watchdog only
     speaks on *changes*, and deliberately says nothing on its first pass
-    (announcing four bots as up every time ParentBot restarts would be noise);
+    (announcing four bots as up every time ManagerBot restarts would be noise);
     a roll-call is the one moment where the current state, changed or not, is
     exactly what you want to see.
 
@@ -1215,7 +1582,7 @@ async def startup_rollcall(context: ContextTypes.DEFAULT_TYPE) -> None:
     once and reporting the whole family together is the same information read
     in one glance.
 
-    Runs on heartbeats, not on process management: ParentBot never starts,
+    Runs on heartbeats, not on process management: ManagerBot never starts,
     stops or supervises the other four, and does not need to in order to say
     what happened. That is what makes this work identically whether the four
     are on this laptop, on Railway, or split across both.
@@ -1228,7 +1595,7 @@ async def startup_rollcall(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Startup roll-call couldn't reach the database: %s", exc)
         await notify_owner(
             context,
-            "\U0001f44b <b>ParentBot is up</b>, but it cannot reach the family "
+            "\U0001f44b <b>ManagerBot is up</b>, but it cannot reach the family "
             "database, so it has no idea who else is.\n"
             f"<code>{html.escape(str(exc))}</code>",
         )
@@ -1263,7 +1630,7 @@ async def startup_rollcall(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     header = (
-        f"\U0001f44b <b>ParentBot is up</b> on {html.escape(family_link.HOSTNAME)} -- "
+        f"\U0001f44b <b>ManagerBot is up</b> on {html.escape(family_link.HOSTNAME)} -- "
         f"{up_count}/{len(CHILDREN)} of the family with it"
     )
     await notify_owner(context, "\n".join([header, "", *lines]))
@@ -1281,7 +1648,7 @@ async def startup_rollcall(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.debug("Couldn't seed bot_state for %s", bot["id"], exc_info=True)
 
 
-# Consecutive failures of ParentBot's own database connection. The owner is
+# Consecutive failures of ManagerBot's own database connection. The owner is
 # told once, not once a minute, and told again when it recovers -- this is
 # the one failure that would otherwise be completely silent, since every
 # other alert path in this file runs through that same database.
@@ -1323,7 +1690,7 @@ async def watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
             _db_alerted = True
             await notify_owner(
                 context,
-                "🚨 <b>ParentBot cannot reach the family database.</b>\n"
+                "🚨 <b>ManagerBot cannot reach the family database.</b>\n"
                 f"<code>{html.escape(str(exc))}</code>\n\n"
                 "Until it comes back I cannot see any bot's state, so treat "
                 "silence from me as unknown, not as healthy.",
@@ -1345,7 +1712,7 @@ async def watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if was_up is None:
             # First sighting -- record it silently. Announcing "StickerBot is
-            # up" the first time ParentBot ever runs is noise, not news.
+            # up" the first time ManagerBot ever runs is noise, not news.
             await asyncio.to_thread(db.set_known_state, bot["id"], is_up)
             if not is_up and beat is not None:
                 await notify_owner(context, f"❌ <b>{bot['name']}</b> is down (first check since I started).")
@@ -1414,7 +1781,7 @@ async def event_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # How long ago each pump actually swept. The interval is chosen from whether
-# the bus is active (family_link.bus_is_active(), set when ParentBot queues a
+# the bus is active (family_link.bus_is_active(), set when ManagerBot queues a
 # command): fast while an answer could be coming back, slow once things have
 # gone quiet -- the same adaptive poll the child bots run for the command
 # queue, and the whole delivery mechanism now that there is no push.
@@ -1489,7 +1856,7 @@ async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
             beat = await asyncio.to_thread(db.heartbeat_of, result["target_bot"])
             theirs = (beat or {}).get("version")
             if theirs and theirs != family_link.VERSION:
-                body += (f"\n\nThat bot is on {theirs}; ParentBot is on "
+                body += (f"\n\nThat bot is on {theirs}; ManagerBot is on "
                          f"{family_link.VERSION}. Most likely it has not been "
                          f"published since the command was written.")
         if result["file_bytes"]:
@@ -1516,12 +1883,12 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 # /start, /help
 # ---------------------------------------------------------------------------
 
-HELP = """👪 <b>ParentBot</b> — the family's manager.
+HELP = """👪 <b>ManagerBot</b> — the family's manager.
 
 <b>Watching</b>
 /status — every bot: up/down, uptime, host, errors, users (with Refresh /
     Alerts / Ping buttons under it)
-/me — ParentBot's own status
+/me — ManagerBot's own status
 /events [bot] [n] — recent crashes, startups, payments
 /alerts on|off — mute or unmute unprompted alerts
 
@@ -1529,13 +1896,16 @@ HELP = """👪 <b>ParentBot</b> — the family's manager.
 /run &lt;bot&gt; &lt;command&gt; [args] — the general form; run it bare for the list
 /ping [bot] — no bot named pings all of them
 /errors &lt;bot&gt; — that bot's errors since it started
-/logs &lt;bot&gt; [n] — tail its errors.log ("bot" at the end for bot.log)
+/logs &lt;bot&gt; [n] — tail its errors.log ("bot" at the end for bot.log, "problems" for problems.log)
+/errorlog [bot] — its latest warnings and errors; name no bot for a button per bot
+/botlog [bot] — everything it logged lately
+/problemlog [bot] — every problem people were shown: time, code, incident
 /whois &lt;bot&gt; &lt;user_id&gt; — look someone up through that bot
 /say &lt;bot&gt; &lt;user_id&gt; &lt;text&gt; — DM someone <i>as</i> that bot
 /dbdump &lt;bot&gt; — that bot's own tables as CSVs
 /restart &lt;bot&gt; — restart its process
 /crashtest &lt;bot&gt; — make it raise on purpose, to check the alert arrives
-    (no bot named crashes ParentBot itself)
+    (no bot named crashes ManagerBot itself)
 /providers [downloader] — which download route is working, which is resting
 /probe &lt;downloader&gt; [platform] — actively try every route, now
 /stars [convert] — the Stars ledger: paid, free and refunded
@@ -1555,7 +1925,9 @@ missing, that is a bug — see family_link.COMMANDS.
 /users [hours] — active users per bot, default 24h
 /donations — paid donations per bot
 /sql &lt;SELECT …&gt; — read-only query on the shared database
-/backup — the entire database as one zip of CSVs
+/backup — the whole database, lossless and restorable, sent here and pinned
+/reports [n] — the latest problem reports people sent
+/decode &lt;code&gt; — what an error code means
 
 Bots: <code>{bots}</code>
 Any unambiguous prefix works — <code>/logs stick</code> is fine."""
@@ -1581,10 +1953,10 @@ async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def crashtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Proves the crash path, the errors.log and the family alert all really
-    fire -- for ParentBot itself, or for any child bot by name.
+    fire -- for ManagerBot itself, or for any child bot by name.
 
     Naming a bot is the more useful direction and the one that was missing.
-    ParentBot crashing tells you ParentBot's own reporting works, which you
+    ManagerBot crashing tells you ManagerBot's own reporting works, which you
     can see happening in front of you. What you actually want to know, when
     a bot has gone quiet, is whether *that* bot would have told you -- and
     that is the one test you could not run from here.
@@ -1599,7 +1971,7 @@ async def crashtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _dispatch(update, context, bot, "crashtest", [])
         return
-    raise RuntimeError("Manual /crashtest trigger -- ParentBot's error tracking works.")
+    raise RuntimeError("Manual /crashtest trigger -- ManagerBot's error tracking works.")
 
 
 # ---------------------------------------------------------------------------
@@ -1626,7 +1998,7 @@ async def crashtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _targets(token: str | None) -> list[dict] | None:
     """The bots a command applies to. No name, or "all", means every child --
-    ParentBot is never a target: it is the one doing the asking, and it has
+    ManagerBot is never a target: it is the one doing the asking, and it has
     no users to announce anything to."""
     if not token or token.lower() == "all":
         return list(CHILDREN)
@@ -1713,7 +2085,7 @@ async def finish_updates_command(update: Update, context: ContextTypes.DEFAULT_T
 # Every other command here affects people who are already mid-something with
 # a bot. This one reaches everyone the bot has ever met, cannot be recalled,
 # and is one fat-fingered bot name away from going to the wrong audience. So
-# it is the one command in ParentBot that asks twice.
+# it is the one command in ManagerBot that asks twice.
 
 BROADCAST_PENDING = "broadcast_pending"
 BROADCAST_PREVIEW = 3000
@@ -1788,18 +2160,21 @@ async def broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # The menu the owner sees, in the order HELP lists them: watching, reaching
 # into a bot, shipping an update, then the family-wide reads. Every command
-# ParentBot handles is here -- it is a private bot with one user, so a command
+# ManagerBot handles is here -- it is a private bot with one user, so a command
 # left out of the menu is a command that has to be remembered instead, which
 # is how /probe and /stars went a version without being typed once.
 BOT_COMMANDS = [
     BotCommand("status", "every bot: up/down, uptime, errors"),
-    BotCommand("me", "ParentBot's own status"),
+    BotCommand("me", "ManagerBot's own status"),
     BotCommand("events", "recent crashes / startups / payments"),
     BotCommand("alerts", "mute or unmute alerts"),
     BotCommand("run", "run a command inside another bot"),
     BotCommand("ping", "ping one bot, or all of them"),
     BotCommand("errors", "a bot's errors since it started"),
     BotCommand("logs", "tail a bot's log"),
+    BotCommand("errorlog", "a bot's latest warnings and errors (tap a bot)"),
+    BotCommand("botlog", "everything a bot logged lately (tap a bot)"),
+    BotCommand("problemlog", "problems users were shown: time, code, incident"),
     BotCommand("whois", "look a user up through a bot"),
     BotCommand("say", "DM someone as one of the bots"),
     BotCommand("dbdump", "one bot's tables as CSVs"),
@@ -1815,9 +2190,13 @@ BOT_COMMANDS = [
     BotCommand("users", "active users per bot"),
     BotCommand("usage", "memory, peaks and what they cost per bot"),
     BotCommand("idle", "how quiet each bot is, and whether sleeping would pay"),
+    BotCommand("balance", "see or change a credit balance"),
+    BotCommand("addcredit", "add ⚡ credit to an account by Telegram id"),
     BotCommand("donations", "paid donations per bot"),
     BotCommand("sql", "read-only query on the shared database"),
-    BotCommand("backup", "whole database as one zip"),
+    BotCommand("backup", "whole database, restorable, pinned here"),
+    BotCommand("reports", "latest problem reports from users"),
+    BotCommand("decode", "what an error code means"),
     BotCommand("help", "what all of this does"),
 ]
 
@@ -1839,7 +2218,7 @@ async def _publish_commands(application):
     and an owner who has not opened their own bot yet is exactly that chat --
     a cosmetic call is not a reason to fail a deploy. Same shape as
     shared_features.publish_commands() in the four public bots; separate
-    because ParentBot's default scope is a refusal rather than a shorter menu.
+    because ManagerBot's default scope is a refusal rather than a shorter menu.
     """
     try:
         await application.bot.set_my_commands(STRANGER_COMMANDS)
@@ -1852,11 +2231,21 @@ async def _publish_commands(application):
         except Exception:
             logger.warning("Couldn't publish the owner's command menu to %s.",
                            admin_id, exc_info=True)
+    # Scopes nothing here writes, cleared so they cannot outrank the ones it
+    # does -- see _UNOWNED_SCOPES in the public bots' shared_features.py.
+    from telegram import (BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats,
+                          BotCommandScopeAllPrivateChats)
+    for scope in (BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
+                  BotCommandScopeAllChatAdministrators):
+        try:
+            await application.bot.delete_my_commands(scope=scope())
+        except Exception:
+            logger.debug("Couldn't clear the %s menu.", scope.__name__, exc_info=True)
 
 
 # The two lines a stranger meets before they press anything: the blurb beside
 # the bot in search results, and what an empty chat shows above the Start
-# button. The four public bots have had these since v1.4.0 and ParentBot was
+# button. The four public bots have had these since v1.4.0 and ManagerBot was
 # skipped, on the reasoning that a private bot with one user has no audience
 # for them. That is the wrong way round -- the owner is the one person who
 # never reads them, and the stranger who has just found a bot called
@@ -1867,7 +2256,7 @@ SHORT_DESCRIPTION = "A private bot. It looks after one person's other bots."
 
 def _description() -> str:
     """Read off USERNAME_ALIASES rather than typed out again, so a bot that
-    gets renamed is renamed here too. ParentBot itself is left out: pointing
+    gets renamed is renamed here too. ManagerBot itself is left out: pointing
     a stranger at the bot they are already looking at helps nobody."""
     siblings = ", ".join(
         "@" + USERNAME_ALIASES[bot["id"]][0]
@@ -1888,7 +2277,7 @@ async def _publish_profile(application):
         await application.bot.set_my_short_description(SHORT_DESCRIPTION)
         await application.bot.set_my_description(_description())
     except Exception:
-        logger.warning("Couldn't publish ParentBot's profile text.", exc_info=True)
+        logger.warning("Couldn't publish ManagerBot's profile text.", exc_info=True)
 
 
 async def _post_init(application):
@@ -1905,13 +2294,13 @@ async def _post_stop(application):
 
 def main():
     if not BOT_TOKEN or not BOT_USERNAME:
-        raise SystemExit("Set PBOT_TOKEN and PBOT_USERNAME environment variables first.")
+        raise SystemExit("Set MBOT_TOKEN and MBOT_USERNAME environment variables first.")
     if not ADMIN_IDS:
         # Every other bot treats an empty admin list as "disable the admin
         # commands". Here that would leave the entire bot open, so it is a
         # hard stop instead.
         raise SystemExit(
-            "PBOT_ADMIN_ID is empty. ParentBot is owner-only by definition and "
+            "MBOT_ADMIN_ID is empty. ManagerBot is owner-only by definition and "
             "refuses to start without knowing who the owner is -- put your numeric "
             "Telegram id there (get it from @userinfobot)."
         )
@@ -1930,7 +2319,7 @@ def main():
     app.add_error_handler(error_handler)
     # Its own group -- see the note in the child bots' main(): a TypeHandler
     # on Update matches everything, so anything sharing a group with it never
-    # runs. ParentBot has nothing else up here today; the numbering is what
+    # runs. ManagerBot has nothing else up here today; the numbering is what
     # keeps that true when it does.
     app.add_handler(TypeHandler(Update, track_activity), group=-3)
 
@@ -1943,13 +2332,20 @@ def main():
     app.add_handler(CommandHandler("ping", broadcast_ping))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("donations", donations_command))
+    app.add_handler(CommandHandler("balance", balance_command))
+    app.add_handler(CommandHandler("addcredit", addcredit_command))
     app.add_handler(CommandHandler("events", events_command))
     app.add_handler(CommandHandler("sql", sql_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("reports", reports_command))
+    app.add_handler(CommandHandler("decode", decode_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("crashtest", crashtest_command))
 
     app.add_handler(CommandHandler("errors", _shortcut("errors", 1, "Usage: /errors <bot>")))
+    app.add_handler(CommandHandler("errorlog", _log_shortcut("errorlog")))
+    app.add_handler(CommandHandler("botlog", _log_shortcut("botlog")))
+    app.add_handler(CommandHandler("problemlog", _log_shortcut("problemlog")))
     app.add_handler(CommandHandler("logs", _shortcut("logs", 1, "Usage: /logs <bot> [lines] [bot|all]")))
     app.add_handler(CommandHandler("dbdump", _shortcut("dbdump", 1, "Usage: /dbdump <bot> — or /backup for everything")))
     app.add_handler(CommandHandler("restart", _shortcut("restart", 1, "Usage: /restart <bot>")))
@@ -1971,17 +2367,18 @@ def main():
     app.add_handler(CallbackQueryHandler(board_button, pattern=r"^board:"))
     app.add_handler(CallbackQueryHandler(ping_detail_button, pattern=r"^pingdet:"))
     app.add_handler(CallbackQueryHandler(broadcast_button, pattern=r"^upd:"))
+    app.add_handler(CallbackQueryHandler(log_pick_button, pattern=r"^logpick:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
 
     if app.job_queue is None:
         # Every other bot degrades quietly without one (family_link just stays
-        # off). ParentBot cannot: the watchdog, the alert pump and the command
+        # off). ManagerBot cannot: the watchdog, the alert pump and the command
         # results are all jobs, and without them it would sit there looking
         # healthy while watching nothing at all.
         raise SystemExit(
             "No JobQueue available, which means no watchdog, no alerts and no /run "
-            'results -- ParentBot would be a shell. Install it with:\n'
+            'results -- ManagerBot would be a shell. Install it with:\n'
             '    pip install "python-telegram-bot[job-queue]"'
         )
 
@@ -1989,10 +2386,10 @@ def main():
     # family.bot_state and the watchdog has nothing left to announce.
     app.job_queue.run_once(startup_rollcall, when=STARTUP_ROLLCALL_SECONDS)
     app.job_queue.run_repeating(watchdog, interval=60, first=20)
-    # ParentBot collects command results and child-bot events on the same
+    # ManagerBot collects command results and child-bot events on the same
     # adaptive poll the child bots run for the command queue: a fast tick that
     # decides each time whether to sweep -- every *_POLL_FAST_SECONDS while the
-    # bus is active (set the moment ParentBot queues a command), every
+    # bus is active (set the moment ManagerBot queues a command), every
     # *_POLL_SECONDS once it has gone quiet. There is no push behind it, so
     # there is nothing to be "down": a pump that is late is late by one idle
     # interval, not by the life of the process.
@@ -2011,15 +2408,15 @@ def main():
         )
         logger.info("Daily digest scheduled for %s UTC.", DIGEST_AT_UTC)
 
-    # ParentBot rides the same bus it runs: it heartbeats like everyone else,
-    # so a second ParentBot (or a plain SQL query) can see whether it is alive.
+    # ManagerBot rides the same bus it runs: it heartbeats like everyone else,
+    # so a second ManagerBot (or a plain SQL query) can see whether it is alive.
     family_link.attach(app, BOT_NAME, DISPLAY_NAME, START_TIME)
     attach_maintenance(app)
 
-    logger.info("ParentBot starting (polling). Watching: %s", bot_list_hint())
+    logger.info("ManagerBot starting (polling). Watching: %s", bot_list_hint())
     # A 30-second long poll is the same latency as the default 10 -- Telegram
     # answers the moment an update exists -- for a third of the HTTP requests.
-    # ParentBot has one user, so nearly every request it makes all day is an
+    # ManagerBot has one user, so nearly every request it makes all day is an
     # empty poll.
     app.run_polling(**lifecycle.polling_kwargs(
         timeout=POLL_TIMEOUT,

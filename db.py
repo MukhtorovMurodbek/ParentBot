@@ -1,14 +1,14 @@
-"""Postgres layer for ParentBot.
+"""Postgres layer for ManagerBot.
 
-ParentBot is the one process in the family that reads *across* schemas. It
-owns `parent_bot.*` (just its own activity log, so the same /status
+ManagerBot is the one process in the family that reads *across* schemas. It
+owns `manager_bot.*` (just its own activity log, so the same /status
 machinery as every other bot works here too), it reads and writes
 `family.*` (heartbeats, events, the command queue -- created by
 family_link.py, which every bot in the family carries), and it reads the
 four public bots' schemas to answer "how many users has ConvertBot had this
 week" without going anywhere near their processes.
 
-Read-only across other bots' schemas, deliberately -- ParentBot never
+Read-only across other bots' schemas, deliberately -- ManagerBot never
 writes into a bot's own tables. When something needs changing inside a bot,
 it goes through the family command queue so that bot does it itself, with
 its own code and its own invariants.
@@ -28,9 +28,9 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/botfamily"
 )
 
-# ParentBot's own schema in the shared database -- same convention as every
+# ManagerBot's own schema in the shared database -- same convention as every
 # other bot (see family_link.py's layout diagram).
-DB_SCHEMA = os.environ.get("DB_SCHEMA", "parent_bot")
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "manager_bot")
 
 # ---------------------------------------------------------------------------
 # Connection-string sanity check
@@ -254,7 +254,7 @@ def init_db(dsn: str = DATABASE_URL) -> None:
     for _problem in check_database_url(dsn):
         logging.getLogger(__name__).warning("%s", _problem)
 
-    """Only ParentBot's own tables. The family.* tables are created by
+    """Only ManagerBot's own tables. The family.* tables are created by
     family_link.init_family_schema(), which runs in every bot including
     this one, so whichever process starts first sets them up."""
     # Deliberately on a plain connection rather than the pool: the offline
@@ -379,7 +379,7 @@ def set_known_state(bot_id: str, is_up: bool) -> None:
 # ---------- family.events ----------
 
 def take_unnotified_events(limit: int = 20) -> list[dict]:
-    """Claims and returns them in one statement, so a ParentBot that gets
+    """Claims and returns them in one statement, so a ManagerBot that gets
     restarted mid-DM doesn't re-send the whole backlog."""
     with pooled() as conn:
         cur = conn.execute(
@@ -413,7 +413,7 @@ def recent_events(limit: int = 15, bot_id: str | None = None) -> list[dict]:
 
 
 def log_event(bot_id: str, level: str, kind: str, message: str) -> None:
-    """ParentBot's own events go in already marked as notified -- it is the
+    """ManagerBot's own events go in already marked as notified -- it is the
     one doing the notifying, so forwarding them to itself would be a loop."""
     with pooled() as conn:
         conn.execute(
@@ -433,7 +433,7 @@ def queue_command(target_bot: str, command: str, args: str, requested_by: int,
     The target finds it on its next bus poll -- about a second if the bus is
     already busy, at most FAMILY_BUS_POLL_IDLE_SECONDS if it has been quiet
     (see family_link._bus_tick). The caller should call
-    family_link.mark_bus_active() right after this so ParentBot's own result
+    family_link.mark_bus_active() right after this so ManagerBot's own result
     pump goes to the fast cadence while the answer is on its way back.
     """
     with pooled() as conn:
@@ -446,7 +446,7 @@ def queue_command(target_bot: str, command: str, args: str, requested_by: int,
         )
         command_id = cur.fetchone()[0]
         conn.commit()
-    # One choke point for every /ping, /run, /pause, ... so ParentBot's result
+    # One choke point for every /ping, /run, /pause, ... so ManagerBot's result
     # pump goes to its fast cadence the instant a command is outstanding,
     # without each call site having to remember to say so. Imported here
     # rather than at module scope because family_link imports this module.
@@ -502,7 +502,7 @@ def expire_stale_commands(after_seconds: int) -> list[dict]:
         return rows
 
 
-# ---------- family.settings (ParentBot's own toggles) ----------
+# ---------- family.settings (ManagerBot's own toggles) ----------
 
 def get_setting(key: str, default: str | None = None) -> str | None:
     with pooled_read() as conn:
@@ -541,7 +541,7 @@ def active_users_by_schema(schemas: list[str], since, include_known: bool = Fals
     been created -- worth showing differently from a real zero.
 
     One connection and one UNION ALL for the whole family. /status ran this
-    query once per bot, each on its own connection; ParentBot's own status
+    query once per bot, each on its own connection; ManagerBot's own status
     screen was eight separate connections to the same database."""
     if not schemas:
         return {}
@@ -590,7 +590,7 @@ def donations_by_schema(schemas: list[str]) -> dict[str, list[tuple[str, int, in
 
 
 def run_readonly_query(sql: str, limit: int = 50):
-    """Backs ParentBot's /sql. The safety here is the connection being
+    """Backs ManagerBot's /sql. The safety here is the connection being
     genuinely read-only at the transaction level -- Postgres itself rejects
     any write, so this does not depend on parsing the statement correctly.
     The keyword check in bot.py is only there to give a friendlier error.
@@ -611,7 +611,7 @@ def run_readonly_query(sql: str, limit: int = 50):
 
 # ---------- housekeeping ----------
 # activity_events is append-only and powers nothing older than the retention
-# window below (/status counts the last hour and since-start, ParentBot's
+# window below (/status counts the last hour and since-start, ManagerBot's
 # /users the last N hours). Left alone it is the one table in this schema that
 # grows without limit, which on a metered database is a bill that only ever
 # goes up. family_link.py's housekeeping job calls this.
@@ -632,7 +632,7 @@ def prune_old_data() -> int:
 # ---------- exports ----------
 
 def dump_database_csv_zip() -> bytes:
-    """ParentBot's own schema only -- same contract as every other bot's
+    """ManagerBot's own schema only -- same contract as every other bot's
     db.py, so family_link's `dbdump` command works here unchanged. For the
     whole family in one file, see dump_family_csv_zip below."""
     return _dump_schemas([DB_SCHEMA])
@@ -688,7 +688,7 @@ def _dump_schemas(schemas: list[str]) -> bytes:
 
 
 def status_snapshot(schemas: list[str], since) -> dict:
-    """Everything ParentBot's /status prints, on one connection: heartbeats,
+    """Everything ManagerBot's /status prints, on one connection: heartbeats,
     per-bot active users, the alerts toggle and the database's own size.
 
     Drawing that board used to mean eight connections -- one for the
