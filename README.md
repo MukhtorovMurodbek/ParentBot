@@ -171,3 +171,13 @@ python family_db.py tables  --at cloud
 
 `..\db_backup.ps1` wraps it (and `pg_dump`, when that's available and new
 enough) into `save` / `load` / `pull` / `push`.
+
+## Licence
+
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+This is the licence the AGPL'd PyMuPDF asks for, and §13 of it is the reason:
+anybody who interacts with this software over a network must be offered its
+source. A Telegram bot is exactly that case, since nobody using it ever holds
+a copy. The source is here, which satisfies §13 for this deployment; anybody
+running a modified version as a service has to publish their changes too.

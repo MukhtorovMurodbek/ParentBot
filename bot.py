@@ -147,6 +147,19 @@ ALERT_LEVELS = {"warning", "error", "critical"}
 # "all fine" message is the kind of thing you stop reading).
 DIGEST_AT_UTC = os.environ.get("MBOT_DIGEST_UTC", "").strip()
 
+# The nightly problem report. The owner asked for it "at around midnight by
+# seoul/suwon time", which is where they are rather than where the users are.
+# Korea has not observed daylight saving since 1988, so KST is UTC+9 all year
+# and 15:00 UTC is midnight in Suwon on every date -- no timezone database
+# needed, and no twice-yearly hour where the report arrives at eleven.
+#
+# Deliberately NOT the release window. That is 04:00 Asia/Tashkent (23:00
+# UTC), chosen for when the *users* are asleep; this one is chosen for when
+# the owner is awake. The two have no reason to be the same time and it would
+# be a bug if changing one moved the other.
+NIGHTLY_REPORT_AT_UTC = os.environ.get("MBOT_NIGHTLY_UTC", "15:00").strip()
+NIGHTLY_REPORT_HOURS = int(os.environ.get("MBOT_NIGHTLY_HOURS", "24"))
+
 TELEGRAM_MAX_CHARS = 3900  # a little under the real 4096, leaving room for markup
 
 # Telegram's long-poll window -- see the note in main().
@@ -764,6 +777,158 @@ def _shortcut(command: str, min_args: int, usage: str, default_bot: str | None =
 
 
 # ---------------------------------------------------------------------------
+# Asking every bot at once
+# ---------------------------------------------------------------------------
+# /errors <bot> was one bot's answer and /errors on its own was a usage line,
+# which is the wrong way round for the question it answers. "Has anything
+# broken?" is a question about the family, and making the owner ask it four
+# times -- and remember four names to ask with -- is four chances to check
+# three bots and forget the fourth.
+#
+# So a command with no bot named goes to all of them and comes back as one
+# message. The machinery is the same as a family /ping: queue the command per
+# bot, remember which group each queued id belongs to, and rewrite one live
+# message as the answers arrive. Written generally because /errors is not the
+# only command shaped this way -- anything read-only and short belongs here.
+
+_FANOUTS: "OrderedDict[int, dict]" = OrderedDict()
+MAX_FANOUTS = 64
+
+
+def _remember_fanout(command_id: int, group: dict) -> None:
+    _FANOUTS[command_id] = group
+    while len(_FANOUTS) > MAX_FANOUTS:
+        _FANOUTS.popitem(last=False)
+
+
+async def _fanout(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                  command: str, args: list, title: str, footer: str = "") -> None:
+    """Ask every child bot the same thing and gather the answers into one
+    message."""
+    targets = list(CHILDREN)
+    live = await LiveMessage.reply_to(update.effective_message,
+                                      f"{title} — asking all {len(targets)}…",
+                                      parse_mode=ParseMode.HTML)
+    group = {"live": live, "title": title, "command": command, "footer": footer,
+             "answers": {}, "queued": set()}
+    # A bot too old for the command is not queued at all: it would sit there
+    # until the timeout and then be reported as down, which is the one wrong
+    # answer that starts a hunt for a fault that is really a missing deploy.
+    for child in targets:
+        beat = await asyncio.to_thread(db.heartbeat_of, child["id"])
+        stale = _too_old_for((beat or {}).get("version"), command, args)
+        if stale:
+            group["answers"][child["id"]] = (
+                "⏳", f"on {(beat or {}).get('version') or 'an unknown version'} — "
+                     f"too old for this command; publish it and ask again.")
+            continue
+        group["queued"].add(child["id"])
+        command_id = await asyncio.to_thread(
+            db.queue_command, child["id"], command, " ".join(args),
+            update.effective_user.id, update.effective_chat.id,
+        )
+        _remember_fanout(command_id, group)
+    if not group["queued"]:
+        await _render_fanout(context, group)
+
+
+def _fanout_text(group: dict) -> str:
+    """One section per bot, in the order the family is declared in -- which is
+    the order every other list in this bot uses, and the order the owner reads
+    them in. Not sorted by how bad the news is: a report whose lines move
+    about between runs is one nobody can skim."""
+    parts = []
+    for child in CHILDREN:
+        answer = group["answers"].get(child["id"])
+        if answer is None:
+            continue
+        mark, body = answer
+        parts.append(f"{mark} <b>{html.escape(child['name'])}</b>\n"
+                     f"{html.escape(body.strip() or '(no output)')}")
+    waiting = len(group["queued"] - set(group["answers"]))
+    head = f"{group['title']}"
+    if waiting > 0:
+        head += f" — waiting on {waiting} more"
+    text = head + "\n\n" + "\n\n".join(parts)
+    # Only once everything is in: a footer that appears under a half-finished
+    # list reads as though the list is finished.
+    if not waiting and group.get("footer"):
+        text += "\n\n" + group["footer"]
+    return text
+
+
+async def _render_fanout(context: ContextTypes.DEFAULT_TYPE, group: dict) -> None:
+    text = _fanout_text(group)
+    if len(text) <= TELEGRAM_MAX_CHARS:
+        await group["live"].set(context.bot, text, parse_mode=ParseMode.HTML)
+        return
+    # Four bots' worth of error tails can outgrow one message. The file is
+    # plain text, so the markup comes off rather than being shown as tags.
+    await group["live"].set(context.bot, f"{group['title']} — the answers are attached.")
+    await context.bot.send_document(
+        chat_id=group["live"].chat_id,
+        document=BytesIO(re.sub(r"<[^>]+>", "", text).encode("utf-8")),
+        filename=f"{group['command']}.txt")
+
+
+async def _deliver_fanout(context: ContextTypes.DEFAULT_TYPE, group: dict, result: dict) -> None:
+    target = resolve_bot(result["target_bot"])
+    key = target["id"] if target else result["target_bot"]
+    if result["status"] == "timeout":
+        group["answers"][key] = ("⏳", f"no answer in {COMMAND_TIMEOUT_SECONDS}s — that bot looks down.")
+    else:
+        group["answers"][key] = ("✅" if result["ok"] else "⚠️", result["output"] or "(no output)")
+    await _render_fanout(context, group)
+
+
+def _recorded_line(counts: dict, hours: int) -> str:
+    """One line summarising what the shared table holds for the same window
+    the live counts cover -- which is what makes the difference between the
+    two commands visible without explaining it every time."""
+    if not counts:
+        return (f"Nothing recorded in the last {hours}h either.\n"
+                f"<i>Above: since each process started, lost on a redeploy. "
+                f"This line: the shared record, which is not.</i>")
+    totals: dict = {}
+    for per_level in counts.values():
+        for level, numbers in per_level.items():
+            totals[level] = totals.get(level, 0) + numbers["incidents"]
+    parts = [f"{problems.LEVEL_ICONS.get(level, '•')} {count} "
+             f"{problems.LEVEL_NAMES.get(level, '?')}"
+             for level, count in sorted(totals.items())]
+    return (f"<b>Recorded, last {hours}h:</b> " + " · ".join(parts)
+            + "\n<i>Above: since each process started, lost on a redeploy. "
+              "This line: the shared record, which is not. "
+              "<code>/nightly</code> breaks it down, <code>/reports</code> goes back further.</i>")
+
+
+async def errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/errors <bot> is that bot's errors since it started. /errors on its own
+    is every bot's, in one message -- which is what the question usually is."""
+    if not await guard(update, context):
+        return
+    args = list(context.args)
+    if args:
+        bot = resolve_bot(args[0])
+        if bot is None:
+            await update.message.reply_text(f"No such bot: {args[0]}. Known: {bot_list_hint()}")
+            return
+        await _dispatch(update, context, bot, "errors", args[1:])
+        return
+    try:
+        counts = await asyncio.to_thread(family_link.problem_counts_since,
+                                         NIGHTLY_REPORT_HOURS)
+        footer = _recorded_line(counts, NIGHTLY_REPORT_HOURS)
+    except Exception:
+        # The live half is the half this command is named for; a database
+        # that will not answer must not cost it.
+        logger.debug("Could not read the recorded problem counts", exc_info=True)
+        footer = ""
+    await _fanout(update, context, "errors", [],
+                  "⚠️ <b>Errors since each bot started</b>", footer=footer)
+
+
+# ---------------------------------------------------------------------------
 # /errorlog, /botlog, /problemlog -- the logs, without remembering how
 # ---------------------------------------------------------------------------
 # The owner asked for "easier commands to see the logs". /logs <bot> [n]
@@ -926,7 +1091,53 @@ def _render_ping(trace: dict, result: dict) -> str:
     up = there.get("up")
     tail = f"\nUp {up}." if up else ""
     return (f"{head}\n\n<pre>{html.escape(chr(10).join(lines))}</pre>\n"
+            f"{_render_user_wait(name, there.get('user') or {})}"
             f"<b>Each end</b>\n{html.escape(ends)}{html.escape(tail)}")
+
+
+def _user_wait_ms(result: dict) -> "float | None":
+    """The number the summary sorts on and shows first: what a person waits
+    for this bot's own work on an info command. None when the bot is too old
+    to measure it, or could not."""
+    try:
+        there = json.loads(result.get("output") or "{}")
+    except ValueError:
+        return None
+    value = (there.get("user") or {}).get("total_ms")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _render_user_wait(name: str, user: dict) -> str:
+    """The other half of the report, and the half anybody outside this chat
+    would recognise.
+
+    The block above it is the admin bus. This is a /start: one indexed read
+    of the row that says which language somebody chose, and one trip to
+    Telegram carrying the answer back. Neither is a guess -- the bot ran both
+    while it was answering the ping.
+
+    What is deliberately not added in is the person's own trip to Telegram.
+    It is the largest term for somebody on mobile data and neither end can
+    measure it, so it is named as missing rather than folded in at a number
+    nobody chose.
+    """
+    if not user:
+        return ""
+    if "total_ms" not in user:
+        trouble = user.get("info_error") or user.get("telegram_error")
+        if not trouble:
+            return ""
+        return f"<b>What a user waits for</b>\n{html.escape(trouble)}\n\n"
+    lines = [
+        _row("reading their row (info)", _ms(user["info_ms"])),
+        _row("handing the reply to Telegram", _ms(user["telegram_ms"])),
+        "-" * 40,
+        _row("an info command, here", _ms(user["total_ms"])),
+    ]
+    note = (f"A /start in {name}: the database read plus the send. Their own trip "
+            f"to Telegram is on top of this, and cannot be measured from either end.")
+    return (f"<b>What a user waits for</b>\n"
+            f"<pre>{html.escape(chr(10).join(lines))}</pre>{html.escape(note)}\n\n")
 
 
 async def _ping_one(update: Update, context: ContextTypes.DEFAULT_TYPE, bot: dict) -> None:
@@ -1069,6 +1280,37 @@ async def ping_detail_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     re.sub(r"<[^>]+>", "", body), filename="ping.txt")
 
 
+def _summary_lines(rows: dict) -> list:
+    """The family ping's table: one bot a line, fastest first.
+
+    Alphabetical was the order until the owner asked for this, and
+    alphabetical is the one order that hides the answer. Four numbers are
+    being compared precisely because one of them might be the odd one out,
+    and finding it meant reading all four, every time.
+
+    Sorted on what a person would actually wait for, falling back to the bus
+    figure for a bot too old to report one. A bot that never answered sorts
+    last whatever it is called: it has no time at all, and putting it first
+    because its name begins with A is the same mistake in a new order.
+    """
+    def key(item):
+        row = item[1]
+        if row.get("user") is not None:
+            return (0, row["user"])
+        if row.get("bus") is not None:
+            return (1, row["bus"])
+        return (2, 0.0)
+
+    lines = []
+    for name, row in sorted(rows.items(), key=key):
+        if row.get("note"):
+            lines.append(f"{name:<14}{row['note']}")
+            continue
+        user = _ms(row["user"]) if row.get("user") is not None else "     ?"
+        lines.append(f"{name:<14}{user} user   {_ms(row['bus'])} bus")
+    return lines
+
+
 async def _deliver_ping(context: ContextTypes.DEFAULT_TYPE, trace: dict, result: dict) -> None:
     """A ping's answer replaces the message that announced it, rather than
     arriving underneath -- and moves to the bottom of the chat by itself if
@@ -1080,21 +1322,28 @@ async def _deliver_ping(context: ContextTypes.DEFAULT_TYPE, trace: dict, result:
 
     name = trace["bot"]["name"]
     if result["status"] == "timeout" or not result.get("claimed_at"):
-        group["rows"][name] = "no answer — down"
+        group["rows"][name] = {"user": None, "bus": None, "note": "no answer — down"}
     else:
-        group["rows"][name] = _ms(result["taken_at"] - result["created_at"]).strip()
+        group["rows"][name] = {
+            "user": _user_wait_ms(result),
+            "bus": (result["taken_at"] - result["created_at"]).total_seconds() * 1000,
+            "note": "",
+        }
     # Kept whole, so the buttons below can print the breakdown without
     # asking the bot anything a second time.
     group["details"][trace["bot"]["id"]] = (trace, result)
-    lines = [f"{n:<14}{v}" for n, v in sorted(group["rows"].items())]
+    lines = _summary_lines(group["rows"])
     missing = group["expected"] - len(group["rows"])
     text = f"🏓 <b>Family ping</b>\n<pre>{html.escape(chr(10).join(lines))}</pre>"
     keyboard = None
     if missing > 0:
         text += f"\nWaiting on {missing} more (down after {COMMAND_TIMEOUT_SECONDS}s)."
     else:
-        text += ("\nAdmin round trip through Postgres — not what a user waits for; "
-                 "their message never takes this path. Tap a bot for its breakdown.")
+        text += ("\n<b>user</b> is an info command answered on the spot — one database "
+                 "read and the send — which is the path everybody except this chat "
+                 "takes. <b>bus</b> is the admin round trip through Postgres, which "
+                 "nobody using a bot ever takes. Fastest first; tap a bot for its "
+                 "breakdown.")
         _remember_group(group)
         keyboard = _ping_keyboard(group)
     await group["live"].set(context.bot, text, parse_mode=ParseMode.HTML,
@@ -1498,23 +1747,246 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reports [n] -- the latest problem reports people sent from the public
-    bots. Each is also messaged to FAMILY_REPORTS_TO as it arrives; this is
-    the list, for when one was missed."""
+    """/reports [n] [mine] -- every problem the public bots have shown anybody,
+    newest first.
+
+    It used to list only the ones somebody chose to report, which made it a
+    list of how many people could be bothered rather than a list of what is
+    going wrong. Since 1.6.1 each bot records a problem the moment it shows
+    it, so this is the whole picture; `mine` narrows it to the ones somebody
+    attached their own details to, which are the ones worth a reply.
+
+    A row here carries nothing about anybody. The details a person volunteered
+    are read one at a time with /report <incident>, which is the point: they
+    are looked up on purpose, not pushed at the owner in a list.
+    """
     if not await guard(update, context):
         return
-    limit = int(context.args[0]) if context.args and context.args[0].isdigit() else 15
-    rows = await asyncio.to_thread(family_link.recent_problem_reports, max(1, min(limit, 50)))
+    args = [a.lower() for a in context.args]
+    shared_only = any(a in ("mine", "shared", "sent") for a in args)
+    limit = next((int(a) for a in args if a.isdigit()), 15)
+    rows = await asyncio.to_thread(family_link.recent_problem_reports,
+                                   max(1, min(limit, 50)), shared_only)
     if not rows:
-        await update.message.reply_text("No problem reports yet.")
+        await update.message.reply_text(
+            "Nobody has attached their details to a problem yet." if shared_only
+            else "No problems recorded yet.")
         return
-    lines = ["🐞 Latest problem reports", ""]
+    lines = ["🐞 " + ("Problems somebody put their name to" if shared_only
+                      else "Latest problems, whether reported or not"), ""]
     for row in rows:
         problem = problems.PROBLEMS.get(row["code"])
-        lines.append(f"{row['reported_at']:%Y-%m-%d %H:%M} · {row['bot_id']} · {row['code']} "
-                     f"({row['incident']}) — {problem.title if problem else 'unknown code'}")
-    lines += ["", "What a code means: /decode <code>"]
-    await update.message.reply_text("\n".join(lines))
+        seen = f" ×{row['seen']}" if (row.get("seen") or 1) > 1 else ""
+        mark = "🙋" if row.get("shared_at") else "  "
+        icon = problems.LEVEL_ICONS.get(int(row.get("level") or problems.level(row["code"])), "•")
+        lines.append(f"{mark}{icon} {row['reported_at']:%m-%d %H:%M} · {row['bot_id']} · "
+                     f"{row['code']}{seen} ({row['incident']}) — "
+                     f"{problem.title if problem else 'unknown code'}")
+    lines += ["", "🚨 urgent (messaged when it happened) · ⚠️ fault · • refused",
+              "🙋 somebody attached their own details — /report <incident>",
+              "What a code means: /decode <code>",
+              f"The last {NIGHTLY_REPORT_HOURS}h, laid out: /nightly"]
+    await send_long(context, update.effective_chat.id, "\n".join(lines), "reports.txt")
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/report <incident> -- one problem in full, including whoever
+    volunteered to be named on it.
+
+    This is the only place the details a person sent are shown, and it takes a
+    deliberate command to get here. The alert that says a report arrived does
+    not carry them: the standing rule is that nothing arrives at the owner's
+    Telegram identifying a user, and somebody consenting to be identified buys
+    the owner the ability to look, not a notification they did not ask for.
+    """
+    if not await guard(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /report <incident> — the six-character "
+                                        "code beside a problem, e.g. /report JNKS4N")
+        return
+    incident = context.args[0].strip().upper()
+    row = await asyncio.to_thread(family_link.problem_report_by_incident, incident)
+    if row is None:
+        await update.message.reply_text(
+            f"No problem recorded as {incident}. /reports lists the recent ones.")
+        return
+    lines = [f"🐞 <b>{html.escape(row['incident'])}</b> · {html.escape(row['bot_id'])} · "
+             f"{html.escape(row['code'])}", ""]
+    if row.get("occurred_at"):
+        lines.append(f"Happened: {row['occurred_at']:%Y-%m-%d %H:%M} UTC")
+    lines.append(f"Recorded: {row['reported_at']:%Y-%m-%d %H:%M} UTC")
+    lines.append(f"Version: {html.escape(str(row.get('version') or '?'))}")
+    level = int(row.get("level") or problems.level(row["code"]))
+    lines.append(f"Level: {problems.LEVEL_ICONS.get(level, '•')} "
+                 f"{problems.LEVEL_NAMES.get(level, '?')}"
+                 + (" — the owner was messaged when it happened" if level == problems.URGENT
+                    else " — in the nightly report"))
+    if (row.get("seen") or 1) > 1:
+        lines.append(f"Shown {row['seen']} times")
+    lines.append("")
+    if row.get("shared_at"):
+        who = f"id {row['user_id']}"
+        if row.get("username"):
+            who += f" (@{html.escape(str(row['username']))})"
+        lines += [f"🙋 <b>Sent by</b> {who}",
+                  f"Language {html.escape(str(row.get('user_lang') or '?'))} · "
+                  f"{html.escape(str(row.get('chat_kind') or '?'))} chat · "
+                  f"attached {row['shared_at']:%Y-%m-%d %H:%M} UTC", ""]
+    else:
+        lines += ["Nobody attached their details to this one — it was recorded "
+                  "automatically, and holds nothing about who hit it.", ""]
+    lines.append(html.escape(problems.decode(row["code"])))
+    text = "\n".join(lines)
+    if len(text) > TELEGRAM_MAX_CHARS:
+        await send_long(context, update.effective_chat.id,
+                        re.sub(r"<[^>]+>", "", text), f"{incident}.txt")
+        return
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# The nightly problem report
+# ---------------------------------------------------------------------------
+# Everything the four bots showed anybody in the last day, in one message, at
+# midnight where the owner is. The owner: "At the end of the day, at around
+# midnight by seoul/suwon time, managerbot should automatically send me a full
+# reply to the report command."
+#
+# It is laid out by how much each line is worth reading, which is what the
+# levels are for:
+#
+#   urgent   listed one by one, with their incidents. These have already been
+#            messaged as they happened -- this is the recap, and seeing the
+#            same three incidents again is the point rather than a duplicate.
+#   faults   grouped by bot and code with a count, because "DL-ALL-ROUTES x9"
+#            is the useful shape and nine separate lines is not.
+#   refused  a count per bot and nothing else. These are the bot working
+#            correctly, and listing them would bury the two lines above.
+#
+# A day with nothing in it still sends, briefly. "Nothing broke today" is
+# information when it arrives every day at the same time; it is only noise
+# when it is the only thing that ever arrives, and the two lines above make
+# sure it is not.
+
+MAX_INCIDENTS_LISTED = 4
+
+
+def _group_problems(rows: list) -> dict:
+    """{level: {(bot, code): [rows]}}, newest first within each group."""
+    grouped: dict = {}
+    for row in rows:
+        level = int(row.get("level") or problems.level(row["code"]))
+        grouped.setdefault(level, {}).setdefault((row["bot_id"], row["code"]), []).append(row)
+    return grouped
+
+
+def _bot_name(bot_id: str) -> str:
+    found = resolve_bot(bot_id)
+    return found["name"] if found else bot_id
+
+
+def build_problem_report(rows: list, hours: int) -> str:
+    """The message. Pure, so tests/test_reporting.py can read it without a
+    database or a Telegram."""
+    grouped = _group_problems(rows)
+    signed = [row for row in rows if row.get("shared_at")]
+    lines = [f"🌙 <b>Problems, last {hours}h</b>"]
+
+    urgent = grouped.get(problems.URGENT, {})
+    if urgent:
+        total = sum(len(group) for group in urgent.values())
+        lines.append(f"\n🚨 <b>Urgent — {total}</b>")
+        for (bot_id, code), group in sorted(urgent.items()):
+            problem = problems.PROBLEMS.get(code)
+            for row in group:
+                mark = " 🙋" if row.get("shared_at") else ""
+                lines.append(
+                    f"  {html.escape(_bot_name(bot_id))} · <code>{html.escape(code)}</code> "
+                    f"({html.escape(row['incident'])}) {row['reported_at']:%H:%M} — "
+                    f"{html.escape(problem.title if problem else 'unknown code')}{mark}")
+
+    faults = grouped.get(problems.FAULT, {})
+    if faults:
+        total = sum(len(group) for group in faults.values())
+        bots = len({bot_id for bot_id, _ in faults})
+        lines.append(f"\n⚠️ <b>Faults — {total} across {bots} bot(s)</b>")
+        for (bot_id, code), group in sorted(faults.items(), key=lambda item: -len(item[1])):
+            problem = problems.PROBLEMS.get(code)
+            shown = [row["incident"] for row in group[:MAX_INCIDENTS_LISTED]]
+            more = len(group) - len(shown)
+            incidents = ", ".join(html.escape(incident) for incident in shown)
+            if more:
+                incidents += f", +{more}"
+            mark = " 🙋" if any(row.get("shared_at") for row in group) else ""
+            lines.append(
+                f"  {html.escape(_bot_name(bot_id))} · <code>{html.escape(code)}</code> "
+                f"×{len(group)} — {html.escape(problem.title if problem else 'unknown code')}"
+                f"{mark}\n      {incidents}")
+
+    refused = grouped.get(problems.REFUSED, {})
+    if refused:
+        per_bot: dict = {}
+        for (bot_id, _), group in refused.items():
+            per_bot[bot_id] = per_bot.get(bot_id, 0) + len(group)
+        total = sum(per_bot.values())
+        listed = " · ".join(f"{html.escape(_bot_name(bot_id))} {count}"
+                            for bot_id, count in sorted(per_bot.items(), key=lambda i: -i[1]))
+        lines.append(f"\n• <b>Refused — {total}</b>\n  {listed}"
+                     f"\n  <i>people told no by a bot that was working correctly</i>")
+
+    if not rows:
+        lines.append("\nNothing at all — no bot showed anybody a problem today.")
+
+    if signed:
+        incidents = ", ".join(f"<code>{html.escape(row['incident'])}</code>" for row in signed[:8])
+        lines.append(f"\n🙋 <b>{len(signed)} attached their own details</b>: {incidents}"
+                     f"\n  <code>/report &lt;incident&gt;</code> to see what they sent.")
+
+    lines.append("\n<code>/reports</code> for the longer history, "
+                 "<code>/errors</code> for what is happening right now.")
+    return "\n".join(lines)
+
+
+async def nightly_problem_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        rows = await asyncio.to_thread(
+            family_link.recent_problem_reports_since, NIGHTLY_REPORT_HOURS)
+    except Exception as exc:
+        await notify_owner(context, f"🌙 Nightly problem report failed: {html.escape(str(exc))}")
+        return
+    text = build_problem_report(rows, NIGHTLY_REPORT_HOURS)
+    if len(text) <= TELEGRAM_MAX_CHARS:
+        await notify_owner(context, text)
+        return
+    # A very bad day can outgrow one message. The head still arrives as a
+    # message rather than only as an attachment, because a day that bad is the
+    # one where a file nobody opens is the worst possible outcome.
+    await notify_owner(context, text[:TELEGRAM_MAX_CHARS])
+    plain = re.sub(r"<[^>]+>", "", text)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_document(
+                chat_id=admin_id, document=BytesIO(plain.encode("utf-8")),
+                filename="problems.txt")
+        except Exception:
+            logger.exception("Couldn't deliver the nightly report file to %s", admin_id)
+
+
+async def nightly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/nightly [hours] -- the report the owner gets at midnight, on demand."""
+    if not await guard(update, context):
+        return
+    hours = int(context.args[0]) if context.args and context.args[0].isdigit() \
+        else NIGHTLY_REPORT_HOURS
+    hours = max(1, min(hours, 168))
+    rows = await asyncio.to_thread(family_link.recent_problem_reports_since, hours)
+    text = build_problem_report(rows, hours)
+    if len(text) > TELEGRAM_MAX_CHARS:
+        await send_long(context, update.effective_chat.id,
+                        re.sub(r"<[^>]+>", "", text), "problems.txt")
+        return
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def decode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1830,6 +2302,13 @@ async def result_pump(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _deliver_ping(context, trace, result)
             continue
 
+        # A command asked of every bot at once rewrites one message rather
+        # than sending four, for the same reason a /ping does.
+        group = _FANOUTS.pop(result["id"], None)
+        if group is not None:
+            await _deliver_fanout(context, group, result)
+            continue
+
         chat_id = result["reply_chat_id"]
         if not chat_id:
             continue
@@ -1895,7 +2374,7 @@ HELP = """👪 <b>ManagerBot</b> — the family's manager.
 <b>Reaching into a bot</b>
 /run &lt;bot&gt; &lt;command&gt; [args] — the general form; run it bare for the list
 /ping [bot] — no bot named pings all of them
-/errors &lt;bot&gt; — that bot's errors since it started
+/errors — what each bot has hit since it started (live; a redeploy clears it)
 /logs &lt;bot&gt; [n] — tail its errors.log ("bot" at the end for bot.log, "problems" for problems.log)
 /errorlog [bot] — its latest warnings and errors; name no bot for a button per bot
 /botlog [bot] — everything it logged lately
@@ -1927,6 +2406,9 @@ missing, that is a bug — see family_link.COMMANDS.
 /sql &lt;SELECT …&gt; — read-only query on the shared database
 /backup — the whole database, lossless and restorable, sent here and pinned
 /reports [n] — the latest problem reports people sent
+/reports [n] [mine] — the shared record, which survives redeploys; "mine" for the ones somebody signed
+/nightly [hours] — the midnight report, on demand: urgent listed, faults grouped, refusals counted
+/report &lt;incident&gt; — one problem in full, with whoever volunteered to be named
 /decode &lt;code&gt; — what an error code means
 
 Bots: <code>{bots}</code>
@@ -2170,7 +2652,7 @@ BOT_COMMANDS = [
     BotCommand("alerts", "mute or unmute alerts"),
     BotCommand("run", "run a command inside another bot"),
     BotCommand("ping", "ping one bot, or all of them"),
-    BotCommand("errors", "a bot's errors since it started"),
+    BotCommand("errors", "errors since start — every bot, or one you name"),
     BotCommand("logs", "tail a bot's log"),
     BotCommand("errorlog", "a bot's latest warnings and errors (tap a bot)"),
     BotCommand("botlog", "everything a bot logged lately (tap a bot)"),
@@ -2195,7 +2677,9 @@ BOT_COMMANDS = [
     BotCommand("donations", "paid donations per bot"),
     BotCommand("sql", "read-only query on the shared database"),
     BotCommand("backup", "whole database, restorable, pinned here"),
-    BotCommand("reports", "latest problem reports from users"),
+    BotCommand("reports", "every problem the bots have shown anybody"),
+    BotCommand("report", "one problem in full, by its incident code"),
+    BotCommand("nightly", "the midnight problem report, now"),
     BotCommand("decode", "what an error code means"),
     BotCommand("help", "what all of this does"),
 ]
@@ -2338,11 +2822,13 @@ def main():
     app.add_handler(CommandHandler("sql", sql_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("reports", reports_command))
+    app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("nightly", nightly_command))
     app.add_handler(CommandHandler("decode", decode_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("crashtest", crashtest_command))
 
-    app.add_handler(CommandHandler("errors", _shortcut("errors", 1, "Usage: /errors <bot>")))
+    app.add_handler(CommandHandler("errors", errors_command))
     app.add_handler(CommandHandler("errorlog", _log_shortcut("errorlog")))
     app.add_handler(CommandHandler("botlog", _log_shortcut("botlog")))
     app.add_handler(CommandHandler("problemlog", _log_shortcut("problemlog")))
@@ -2407,6 +2893,13 @@ def main():
             daily_digest, time(int(hour), int(minute or 0), tzinfo=timezone.utc)
         )
         logger.info("Daily digest scheduled for %s UTC.", DIGEST_AT_UTC)
+    if NIGHTLY_REPORT_AT_UTC:
+        hour, _, minute = NIGHTLY_REPORT_AT_UTC.partition(":")
+        app.job_queue.run_daily(
+            nightly_problem_report, time(int(hour), int(minute or 0), tzinfo=timezone.utc)
+        )
+        logger.info("Nightly problem report scheduled for %s UTC (midnight in Seoul).",
+                    NIGHTLY_REPORT_AT_UTC)
 
     # ManagerBot rides the same bus it runs: it heartbeats like everyone else,
     # so a second ManagerBot (or a plain SQL query) can see whether it is alive.

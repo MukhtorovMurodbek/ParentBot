@@ -15,7 +15,9 @@ line for every key in KEYS; a message assembled from several strings gets it
 at its end, where it is assembled (ConvertBot's job endings, StickerBot's
 sticker errors and imports, DownloaderBot's allowance message).
 shared_features logs every message that ends in one, with its time and incident,
-and puts a report button under the ones that are not SIMPLE.
+and puts a report button under the ones that are not SIMPLE. Every code also
+has a LEVEL -- see the block above `reportable()` -- which decides whether the
+owner hears about it now or in the nightly report.
 
 Copied, not imported, into all five bots -- ManagerBot's /decode reads it.
 Pure: no Telegram, no database, nothing that can fail at import.
@@ -543,26 +545,22 @@ PROBLEMS = {
         "A guest using the owner's command.",
         "Nothing."),
     "AN-EXPORT-FAILED": Problem(
-        "AnonBot", "Building the transcript failed",
-        "Placing or rendering the forwarded messages failed; nothing was kept and the forwards were left in "
-        "the chat.",
-        "A bug, or the database failing during the relay lookup.",
+        "AnonBot", "Building the document failed",
+        "Reading the conversation or rendering the page failed; nothing was sent and nothing was kept.",
+        "A bug, the database failing during the relay lookup, or Telegram refusing every forward.",
         "The traceback beside 'Could not build a transcript' in the log."),
-    "AN-EXPORT-ENDED": Problem(
-        "AnonBot", "Export session ended",
-        "Build was tapped after the export session had ended.",
-        "More than 15 minutes, a restart, or Cancel.",
+    "AN-EXPORT-GONE": Problem(
+        "AnonBot", "That conversation is no longer on record",
+        "A conversation chosen for export had no relay rows left by the time the button was tapped.",
+        "prune_old_data clearing a long-silent conversation, or /cancel removing it, between the "
+        "menu being drawn and the button being tapped.",
+        "Nothing. RELAY_RETENTION_DAYS is what decides how long a conversation stays exportable."),
+    "AN-EXPORT-NOTHING": Problem(
+        "AnonBot", "Nothing to export",
+        "/export was sent by somebody with no conversation on record in this chat.",
+        "Never having used an inbox link in either direction, or every conversation being older "
+        "than RELAY_RETENTION_DAYS.",
         "Nothing."),
-    "AN-EXPORT-EMPTY": Problem(
-        "AnonBot", "Nothing forwarded yet",
-        "Build was tapped before any message was forwarded.",
-        "Tapping Build first.",
-        "Nothing."),
-    "AN-EXPORT-FULL": Problem(
-        "AnonBot", "Transcript full",
-        "The session reached its ceiling of messages or characters.",
-        "A very large selection.",
-        "transcript.MAX_ITEMS and MAX_CHARS, if real use needs more."),
     "AN-UNADDRESSED": Problem(
         "AnonBot", "Message with nowhere to go",
         "A message from somebody with no inbox and no open conversation.",
@@ -667,9 +665,8 @@ KEYS = {
         "which_unknown": "AN-WHICH-UNKNOWN",
         "archive_not_owner": "AN-ARCHIVE-OWNER-ONLY",
         "export_failed": "AN-EXPORT-FAILED",
-        "export_ended": "AN-EXPORT-ENDED",
-        "export_nothing_yet": "AN-EXPORT-EMPTY",
-        "export_full": "AN-EXPORT-FULL",
+        "export_gone": "AN-EXPORT-GONE",
+        "export_nothing_to_export": "AN-EXPORT-NOTHING",
         "generic_nudge": "AN-UNADDRESSED",
     },
 }
@@ -721,9 +718,83 @@ SIMPLE = frozenset({
     "AN-LINK-INVALID", "AN-LINK-BLOCKED", "AN-LINK-PAUSED", "AN-INBOX-GONE", "AN-SENDER-BLOCKED",
     "AN-NOT-STARTED", "AN-NEEDS-REPLY", "AN-OPENING-NEEDS-REPLY", "AN-AMBIGUOUS", "AN-REPLY-BLOCKED",
     "AN-REPLY-STALE", "AN-TOO-FAST", "AN-EDIT-NOT-RELAYED", "AN-CONV-GONE", "AN-NOT-YOURS",
-    "AN-NO-ANCHOR", "AN-WHICH-UNKNOWN", "AN-ARCHIVE-OWNER-ONLY", "AN-EXPORT-ENDED",
-    "AN-EXPORT-EMPTY", "AN-EXPORT-FULL", "AN-UNADDRESSED",
+    "AN-NO-ANCHOR", "AN-WHICH-UNKNOWN", "AN-ARCHIVE-OWNER-ONLY", "AN-EXPORT-GONE",
+    "AN-EXPORT-NOTHING", "AN-UNADDRESSED",
 })
+
+
+# ---------------------------------------------------------------------------
+# How loudly a problem should be answered
+# ---------------------------------------------------------------------------
+# The owner, in 1.6.1: "Give priority levels for errors. The highest level
+# errors should be sent to me immediately. The most important of those can be
+# when a bot crashes entirely. Other errors should be visible in the report
+# command."
+#
+# Three levels, and the line between them is *whose fault it is and how much
+# of the bot it takes down*:
+#
+#   1 URGENT   The bot is broken, or something that had to happen did not:
+#              a crash, a disk with no room left, a message that was accepted
+#              and then never delivered, money taken with nothing to show for
+#              it. One of these is worth a message at three in the morning
+#              because waiting until midnight makes it worse.
+#
+#   2 FAULT    One person asked for something and the bot could not do it,
+#              through no fault of theirs -- a download that failed, a
+#              conversion that timed out, Telegram refusing a sticker. Worth
+#              knowing about, not worth waking up for. Into the daily report.
+#
+#   3 REFUSED  The bot did exactly the right thing and said no: a file over
+#              the limit, a format nobody supports, a quota, an unknown
+#              command. Not a fault at all, and the reason SIMPLE exists --
+#              these are the problems whose own message explains them. Counted
+#              in the daily report, never listed one by one.
+#
+# A level-2 code can still reach the owner immediately without being promoted:
+# see BURST_ESCALATION in shared_features. Fifty of the same failure in an
+# hour is not fifty people having bad luck, it is a route that has gone down,
+# and that is a level-1 fact assembled out of level-2 parts.
+
+URGENT, FAULT, REFUSED = 1, 2, 3
+
+URGENT_CODES = frozenset({
+    # The bot itself fell over.
+    "FM-CRASH", "CV-CRASH",
+    # Money moved, or should have and did not.
+    "FM-INVOICE",
+    # A legal obligation the bot failed to honour.
+    "FM-ERASE",
+    # No room left on the machine -- everybody's next request fails too.
+    "CV-STORAGE-FULL", "DL-NO-SPACE",
+    # Work accepted and then lost to a restart.
+    "CV-RESTARTED",
+    # AnonBot took a message and did not deliver it. The whole bot is a
+    # promise to carry one message to one person, so this is the only
+    # failure it has that is not recoverable by trying again -- the sender
+    # believes it arrived.
+    "AN-DELIVERY", "AN-REPLY-FAILED",
+})
+
+
+def level(code) -> int:
+    """URGENT, FAULT or REFUSED for a code. An unknown code is a FAULT: it
+    came from somewhere, and guessing that it is harmless is the wrong way to
+    be wrong."""
+    if code in URGENT_CODES:
+        return URGENT
+    if code in SIMPLE:
+        return REFUSED
+    return FAULT
+
+
+LEVEL_NAMES = {URGENT: "urgent", FAULT: "fault", REFUSED: "refused"}
+LEVEL_ICONS = {URGENT: "🚨", FAULT: "⚠️", REFUSED: "•"}
+
+
+def urgent(code) -> bool:
+    """Whether this one is worth interrupting the owner for."""
+    return level(code) == URGENT
 
 
 def reportable(code) -> bool:

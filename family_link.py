@@ -76,7 +76,12 @@ FAMILY_SCHEMA = "family"
 # Bumped with the family's version (see CHANGELOG.md) -- reported in
 # heartbeats so /status can show which bots are running stale code after a
 # partial deploy.
-VERSION = os.environ.get("FAMILY_VERSION", "1.6.0")
+VERSION = os.environ.get("FAMILY_VERSION", "1.6.1")
+
+# Before 1.6.1 a row in family.problem_reports only existed because somebody
+# tapped Report, so every row older than this is one of those and is marked
+# as shared. After it, most rows are automatic and carry nothing personal.
+_REPORTS_BECAME_AUTOMATIC = datetime(2026, 9, 13, tzinfo=timezone.utc)
 
 HEARTBEAT_SECONDS = int(os.environ.get("FAMILY_HEARTBEAT_SECONDS", "30"))
 
@@ -381,10 +386,20 @@ def init_family_schema() -> None:
             f"CREATE INDEX IF NOT EXISTS idx_family_bonus_lots_user "
             f"ON {FAMILY_SCHEMA}.star_bonus_lots (user_id, expires_at)"
         )
-        # Problem reports people choose to send (see problems.py). Nothing in
-        # a row identifies anybody: which bot, the code, the incident, when it
-        # happened, and the version. One row per incident, so a double tap
-        # stores and notifies once.
+        # Every problem any bot shows anybody (see problems.py). One row per
+        # incident, so a redraw or a double tap stores once.
+        #
+        # The row is written the moment the problem is *shown*, not when
+        # somebody decides to report it -- the owner: "It should include the
+        # error without user pressing the report button, but should only store
+        # generic technical data with no user specific info". So the columns
+        # in the CREATE are all a row has unless its person volunteered more:
+        # which bot, the code, the incident, when it happened, the version.
+        # None of them is about anybody.
+        #
+        # The columns added below are filled in only by somebody tapping
+        # Report and then Send, having read exactly what those columns are. A
+        # row with `shared_at` NULL has never carried anything about a person.
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {FAMILY_SCHEMA}.problem_reports (
@@ -398,6 +413,41 @@ def init_family_schema() -> None:
                 UNIQUE (bot_id, incident)
             )
             """
+        )
+        # Added in 1.6.1, to a table that held reports only before it.
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS shared_at TIMESTAMPTZ")
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS username TEXT")
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS user_lang TEXT")
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS chat_kind TEXT")
+        # How many times this exact problem was shown. An incident is one
+        # occurrence, so this only moves when the same message is re-shown --
+        # a status line redrawn with the failure still on it.
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS seen INTEGER NOT NULL DEFAULT 1")
+        # 1 urgent, 2 fault, 3 refused -- see problems.level(). Stored rather
+        # than derived on read, so that a row keeps the seriousness it had
+        # when it happened: re-classifying a code later must not rewrite what
+        # last month's nightly reports said.
+        conn.execute(f"ALTER TABLE {FAMILY_SCHEMA}.problem_reports "
+                     f"ADD COLUMN IF NOT EXISTS level INTEGER NOT NULL DEFAULT 2")
+        # Everything in the table before 1.6.1 arrived through the Report
+        # button, which is what `shared_at` now means. Stamped with the time
+        # the report came in, which is the only time those rows carry.
+        conn.execute(f"UPDATE {FAMILY_SCHEMA}.problem_reports "
+                     f"SET shared_at = reported_at "
+                     f"WHERE shared_at IS NULL AND reported_at < %s",
+                     (_REPORTS_BECAME_AUTOMATIC,))
+        # /reports reads newest first over a table that now grows with every
+        # problem rather than with every report.
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_family_problem_reports_recent "
+            f"ON {FAMILY_SCHEMA}.problem_reports (reported_at DESC)"
         )
         conn.commit()
 
@@ -844,29 +894,190 @@ def star_balance_overview(limit: int = 20) -> tuple[dict, list[dict]]:
     )
 
 
-def record_problem_report(code: str, incident: str, occurred_at) -> bool:
-    """Store a problem report. True if it is new, False if this incident was
-    already reported from this bot."""
+def record_problem_occurrence(code: str, incident: str, occurred_at, level: int = 2) -> bool:
+    """Write down that this problem was shown. True the first time an incident
+    is seen, False for a re-show of the same one.
+
+    Called for every coded message any bot sends, whether or not anybody ever
+    taps Report. Nothing here is about a person: the bot, the code, the
+    incident, when, and the version. `seen` counts re-shows, so a status line
+    redrawn with the same failure on it does not become a second problem.
+    """
     with _connect() as conn:
         row = conn.execute(
-            f"INSERT INTO {FAMILY_SCHEMA}.problem_reports (bot_id, code, incident, occurred_at, version) "
-            f"VALUES (%s, %s, %s, %s, %s) ON CONFLICT (bot_id, incident) DO NOTHING RETURNING id",
-            (_ledger_bot(), code, incident, occurred_at, VERSION),
+            f"INSERT INTO {FAMILY_SCHEMA}.problem_reports "
+            f"(bot_id, code, incident, occurred_at, version, level) "
+            f"VALUES (%s, %s, %s, %s, %s, %s) "
+            f"ON CONFLICT (bot_id, incident) DO UPDATE "
+            f"SET seen = {FAMILY_SCHEMA}.problem_reports.seen + 1 "
+            f"RETURNING (xmax = 0)",
+            (_ledger_bot(), code, incident, occurred_at, VERSION, int(level)),
+        ).fetchone()
+        conn.commit()
+    return bool(row and row[0])
+
+
+def attach_problem_reporter(code: str, incident: str, occurred_at,
+                            user_id: int, username: "str | None",
+                            user_lang: "str | None", chat_kind: "str | None",
+                            level: int = 2) -> bool:
+    """Add the details somebody volunteered to their incident's row. True if
+    this is the first time anybody has attached themselves to it.
+
+    The row usually exists already -- record_problem_occurrence wrote it when
+    the problem was shown. The INSERT covers the one case where it does not: a
+    bot that could not reach the database at the moment of the failure, which
+    is exactly the kind of failure most worth having reported.
+
+    Everything written here was named to the person, on screen, before they
+    tapped Send. Nothing reaches this function any other way.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            f"INSERT INTO {FAMILY_SCHEMA}.problem_reports "
+            f"(bot_id, code, incident, occurred_at, version, level, shared_at, "
+            f" user_id, username, user_lang, chat_kind) "
+            f"VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s, %s, %s) "
+            f"ON CONFLICT (bot_id, incident) DO UPDATE "
+            f"SET shared_at = now(), user_id = excluded.user_id, "
+            f"    username = excluded.username, user_lang = excluded.user_lang, "
+            f"    chat_kind = excluded.chat_kind "
+            f"WHERE {FAMILY_SCHEMA}.problem_reports.shared_at IS NULL "
+            f"RETURNING id",
+            (_ledger_bot(), code, incident, occurred_at, VERSION, int(level),
+             user_id, username, user_lang, chat_kind),
         ).fetchone()
         conn.commit()
     return row is not None
 
 
-def recent_problem_reports(limit: int = 15) -> list[dict]:
-    """The latest problem reports, newest first."""
+def recent_problem_reports(limit: int = 15, shared_only: bool = False) -> list[dict]:
+    """The latest problems, newest first. `shared_only` narrows it to the ones
+    somebody attached their own details to."""
+    where = " WHERE shared_at IS NOT NULL" if shared_only else ""
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT reported_at, bot_id, code, incident, occurred_at, version "
-            f"FROM {FAMILY_SCHEMA}.problem_reports ORDER BY id DESC LIMIT %s",
+            f"SELECT reported_at, bot_id, code, incident, occurred_at, version, "
+            f"seen, shared_at, user_id, username, user_lang, chat_kind, level "
+            f"FROM {FAMILY_SCHEMA}.problem_reports{where} ORDER BY id DESC LIMIT %s",
             (max(1, min(limit, 100)),),
         ).fetchall()
-    return [{"reported_at": r[0], "bot_id": r[1], "code": r[2], "incident": r[3],
-             "occurred_at": r[4], "version": r[5]} for r in rows]
+    return [_problem_row(r) for r in rows]
+
+
+def problem_report_by_incident(incident: str) -> "dict | None":
+    """One incident, whichever bot it came from.
+
+    This is where details somebody volunteered are read: deliberately, by the
+    owner asking for that incident, rather than pushed at them in an alert.
+    The alert says a report arrived and nothing about who sent it.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT reported_at, bot_id, code, incident, occurred_at, version, "
+            f"seen, shared_at, user_id, username, user_lang, chat_kind, level "
+            f"FROM {FAMILY_SCHEMA}.problem_reports WHERE incident = %s "
+            f"ORDER BY id DESC LIMIT 1",
+            (incident,),
+        ).fetchone()
+    return _problem_row(row) if row is not None else None
+
+
+def _problem_row(r) -> dict:
+    return {"reported_at": r[0], "bot_id": r[1], "code": r[2], "incident": r[3],
+            "occurred_at": r[4], "version": r[5], "seen": r[6], "shared_at": r[7],
+            "user_id": r[8], "username": r[9], "user_lang": r[10], "chat_kind": r[11],
+            "level": r[12]}
+
+
+def recent_problem_reports_since(hours: int = 24, limit: int = 400) -> list:
+    """Everything recorded in the last `hours`, newest first. What the nightly
+    report is built from -- one read rather than one per bot, because the
+    report is about the family and the table already knows which bot each row
+    came from."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT reported_at, bot_id, code, incident, occurred_at, version, "
+            f"seen, shared_at, user_id, username, user_lang, chat_kind, level "
+            f"FROM {FAMILY_SCHEMA}.problem_reports "
+            f"WHERE reported_at > now() - make_interval(hours => %s) "
+            f"ORDER BY id DESC LIMIT %s",
+            (max(1, min(hours, 168)), max(1, min(limit, 1000))),
+        ).fetchall()
+    return [_problem_row(r) for r in rows]
+
+
+def problem_counts_since(hours: int = 24) -> dict:
+    """{bot_id: {level: count}} for the last `hours`. The cheap version of the
+    line above, for a summary that only needs numbers."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT bot_id, level, count(*), coalesce(sum(seen), 0) "
+            f"FROM {FAMILY_SCHEMA}.problem_reports "
+            f"WHERE reported_at > now() - make_interval(hours => %s) "
+            f"GROUP BY bot_id, level",
+            (max(1, min(hours, 168)),),
+        ).fetchall()
+    out: dict = {}
+    for bot_id, level, incidents, seen in rows:
+        out.setdefault(bot_id, {})[int(level)] = {"incidents": int(incidents), "seen": int(seen)}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Getting rid of them again
+# ---------------------------------------------------------------------------
+# Two different clocks, because the two halves of a row are two different
+# things. The generic half -- code, incident, time, version -- is about the
+# software and is not about anybody, so it can be kept long enough to tell
+# whether a fault is new or has been happening since June. The half somebody
+# volunteered *is* about them, and the reason it was collected (finding their
+# case in the logs) stops applying within days of the fault being fixed.
+#
+# So the details are cleared first and the row survives without them, which
+# keeps the count honest -- the fault still happened -- while holding nothing
+# about who hit it. `/deletemydata` does the same thing immediately, for one
+# person, whether or not the clock has run out.
+PROBLEM_DETAIL_RETENTION_DAYS = int(os.environ.get("PROBLEM_DETAIL_RETENTION_DAYS", "30"))
+PROBLEM_RETENTION_DAYS = int(os.environ.get("PROBLEM_RETENTION_DAYS", "180"))
+
+
+def prune_problem_reports() -> int:
+    """Clear old volunteered details, then drop old rows entirely. Returns how
+    many rows were changed or removed."""
+    with _connect() as conn:
+        cleared = conn.execute(
+            f"UPDATE {FAMILY_SCHEMA}.problem_reports "
+            f"SET user_id = NULL, username = NULL, user_lang = NULL, chat_kind = NULL "
+            f"WHERE shared_at IS NOT NULL AND user_id IS NOT NULL "
+            f"AND shared_at < now() - make_interval(days => %s)",
+            (PROBLEM_DETAIL_RETENTION_DAYS,),
+        ).rowcount or 0
+        removed = conn.execute(
+            f"DELETE FROM {FAMILY_SCHEMA}.problem_reports "
+            f"WHERE reported_at < now() - make_interval(days => %s)",
+            (PROBLEM_RETENTION_DAYS,),
+        ).rowcount or 0
+        conn.commit()
+    return cleared + removed
+
+
+def forget_problem_reporter(user_id: int) -> int:
+    """Take one person off every problem they ever volunteered for, now.
+
+    The rows stay, without them: a fault that happened still happened, and the
+    count of it is not personal data. Called by /deletemydata in every bot, so
+    that "erase what you have on me" covers the family table as well as the
+    bot's own."""
+    with _connect() as conn:
+        changed = conn.execute(
+            f"UPDATE {FAMILY_SCHEMA}.problem_reports "
+            f"SET user_id = NULL, username = NULL, user_lang = NULL, chat_kind = NULL "
+            f"WHERE user_id = %s",
+            (user_id,),
+        ).rowcount or 0
+        conn.commit()
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1294,59 @@ def ping_probe() -> dict:
     }
 
 
+# The id the user-path probe reads with. Not anybody's: it is below every id
+# Telegram issues, so the SELECT walks the same index to the same depth as a
+# real lookup and finds nothing, and no real person's row is read to time a
+# ping.
+PROBE_USER_ID = 0
+
+
+def user_path_probe() -> dict:
+    """Blocking -- call through asyncio.to_thread. The database half of what a
+    person actually waits for.
+
+    /ping measures the **admin bus**: ManagerBot writing a row in Postgres,
+    this bot noticing it, answering into another row, ManagerBot collecting
+    it. Nobody using the bot ever takes that path, which is why the report
+    says so -- but saying "this is not what a user waits for" and then not
+    saying what a user *does* wait for leaves the useful question unanswered.
+
+    An info command is the cheapest real thing a person can ask for -- /start
+    with a language already chosen is one indexed read of `user_settings` and
+    one reply -- and it is the floor under every other answer this bot gives.
+    So the read is done here, for real, through the same pool every handler
+    uses, and reported next to the trip to Telegram that carries the answer
+    back.
+    """
+    read = getattr(db, "get_user_language", None)
+    started = time.perf_counter()
+    if read is not None:
+        read(PROBE_USER_ID)
+        what = "user_settings"
+    else:
+        # ManagerBot has no user_settings. Time the pool itself rather than
+        # report nothing -- it is the same round trip minus the index walk.
+        with db.pooled_read() as conn:
+            conn.execute("SELECT 1").fetchone()
+        what = "SELECT 1"
+    return {"info_ms": round((time.perf_counter() - started) * 1000, 2), "info_query": what}
+
+
+async def _telegram_round_trip(context) -> float | None:
+    """One call to the Bot API and back, in milliseconds.
+
+    getWebhookInfo, because it is the cheapest method that always goes to
+    Telegram: getMe is cached by python-telegram-bot after startup and would
+    report nought, which is the one wrong answer that looks like a fast one.
+    """
+    bot = getattr(context, "bot", None)
+    if bot is None or not hasattr(bot, "get_webhook_info"):
+        return None
+    started = time.perf_counter()
+    await bot.get_webhook_info()
+    return round((time.perf_counter() - started) * 1000, 2)
+
+
 async def _cmd_ping(context, args):
     """Plain `ping` answers a sentence. `ping trace` answers the numbers
     ManagerBot needs to draw the full round trip -- see its /ping."""
@@ -1094,6 +1358,27 @@ async def _cmd_ping(context, args):
     except Exception as exc:
         probe = {"error": f"{type(exc).__name__}: {exc}"}
     probe["up"] = _format_delta(up)
+    # What a person waits for, measured rather than guessed. Both halves are
+    # optional: a failure here must not cost the round trip its report, which
+    # is the number the command was written for.
+    user: dict = {}
+    try:
+        user.update(await asyncio.to_thread(user_path_probe))
+    except Exception as exc:
+        user["info_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        telegram_ms = await _telegram_round_trip(context)
+        if telegram_ms is not None:
+            user["telegram_ms"] = telegram_ms
+    except Exception as exc:
+        user["telegram_error"] = f"{type(exc).__name__}: {exc}"
+    if "info_ms" in user and "telegram_ms" in user:
+        # The answer's own cost: read the row, hand the reply to Telegram.
+        # Their trip to Telegram and back is on top and is not measurable
+        # from here, which is what the report says rather than folding an
+        # invented number in.
+        user["total_ms"] = round(user["info_ms"] + user["telegram_ms"], 2)
+    probe["user"] = user
     return json.dumps(probe, separators=(",", ":")), None, None
 
 
@@ -1733,6 +2018,15 @@ def _prune() -> str:
         parts.append(f"{expire_bonus_credit()} expired bonus credit")
     except Exception:
         logger.debug("Could not expire bonus credit", exc_info=True)
+    # The volunteered halves of old problem reports, and then the old rows.
+    # Every bot runs this over the shared table rather than only its own rows:
+    # it is idempotent, it is a cheap indexed delete, and a family table that
+    # only gets tidied when one particular bot happens to be up is a family
+    # table that grows whenever that bot is the one that is down.
+    try:
+        parts.append(f"{prune_problem_reports()} problem row(s)")
+    except Exception:
+        logger.debug("Could not prune problem reports", exc_info=True)
     own = getattr(db, "prune_old_data", None)
     if own is not None:
         parts.append(f"{own()} activity row(s)")
